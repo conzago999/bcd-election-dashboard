@@ -1,0 +1,20 @@
+# BCD - Boone County Democrats Election Data Tool
+
+# Dashboard (required for Streamlit Cloud deployment)
+streamlit>=1.28
+pandas>=2.0
+plotly>=5.15
+numpy>=1.24
+openpyxl>=3.1
+
+# PDF extraction (for local data import only, not needed for dashboard)
+pdfplumber>=0.10
+tabula-py>=2.8
+
+# Analysis
+scipy>=1.11
+matplotlib>=3.7
+
+# Utilities
+click>=8.1
+python-dateutil>=2.8
