@@ -156,6 +156,25 @@ def init_db(db_path=None):
         )
     """)
 
+    # -- Data quality / confidence scoring per election --
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS data_quality (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            election_id INTEGER NOT NULL,
+            overall_confidence TEXT NOT NULL,  -- 'high', 'medium', 'low'
+            confidence_score REAL NOT NULL,    -- 0.0 to 1.0
+            source_type TEXT,                 -- 'digital_pdf', 'scanned_pdf', 'manual_entry', 'excel'
+            pdf_parsed_ok INTEGER DEFAULT 1,  -- 1=clean parse, 0=had issues
+            cross_validated INTEGER DEFAULT 0, -- 1=validated against PDF headers
+            race_names_clean INTEGER DEFAULT 0, -- 1=no corrupted race names detected
+            turnout_consistent INTEGER DEFAULT 0, -- 1=turnout matches ballot counts
+            precinct_count_match INTEGER DEFAULT 0, -- 1=precinct count matches PDF header
+            notes TEXT,
+            assessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (election_id) REFERENCES elections(id)
+        )
+    """)
+
     conn.commit()
     conn.close()
     return True

@@ -38,7 +38,7 @@ def get_dem_vote_share_by_election(race_level=None, db_path=None):
         JOIN races r ON res.race_id = r.id
         JOIN candidates c ON res.candidate_id = c.id
         JOIN elections e ON r.election_id = e.id
-        WHERE res.precinct_id IS NOT NULL OR res.precinct_id IS NULL
+        WHERE r.race_level IN ('federal', 'state', 'county', 'local')
     """
     if race_level:
         query += f" AND r.race_level = '{race_level}'"
@@ -161,12 +161,15 @@ def get_competitive_races(min_margin=15, db_path=None):
     """
     Identify races where the margin was close enough to be competitive.
     Default: races decided by less than 15 points.
+    Only includes races where both D and R received votes (actual contests).
     """
     vote_shares = get_dem_vote_share_by_election(db_path=db_path)
     if vote_shares.empty:
         return vote_shares
 
-    competitive = vote_shares[abs(vote_shares["margin"]) <= min_margin].copy()
+    # Filter to actual contested races (both D and R got votes)
+    contested = vote_shares[(vote_shares["dem_votes"] > 0) & (vote_shares["rep_votes"] > 0)].copy()
+    competitive = contested[abs(contested["margin"]) <= min_margin].copy()
     competitive = competitive.sort_values("margin", ascending=False)
     return competitive
 
@@ -638,6 +641,713 @@ def get_straight_ticket_analysis(db_path=None):
 
     trend_summary = pd.DataFrame(trend_rows)
     return precinct_detail, trend_summary
+
+
+def get_precinct_volatility(min_elections=4, db_path=None):
+    """
+    Measures average election-to-election D share swing per precinct.
+    High volatility = persuadable voters who change behavior.
+    """
+    base = _get_precinct_dem_share_base(db_path)
+    if base.empty:
+        return base
+
+    results = []
+    for precinct, group in base.sort_values("election_date").groupby("precinct"):
+        if len(group) < min_elections:
+            continue
+        shares = group["d_share"].values
+        swings = np.abs(np.diff(shares))
+        results.append({
+            "precinct": precinct,
+            "volatility": round(float(np.mean(swings)), 2),
+            "max_swing": round(float(np.max(swings)), 2),
+            "elections_counted": len(group),
+            "avg_d_share": round(float(group["d_share"].mean()), 2),
+            "latest_d_share": round(float(shares[-1]), 2),
+        })
+
+    return pd.DataFrame(results).sort_values("volatility", ascending=False) if results else pd.DataFrame()
+
+
+def get_precinct_pvi(db_path=None):
+    """
+    Local Cook PVI: each precinct's average presidential D share
+    compared to the county average, expressed as D+X or R+X.
+    Uses general election presidential races only.
+    """
+    conn = get_connection(db_path)
+    query = """
+        SELECT
+            UPPER(p.precinct_name) as precinct,
+            e.election_date,
+            SUM(CASE WHEN c.party = 'D' THEN res.votes ELSE 0 END) as dem_votes,
+            SUM(CASE WHEN c.party = 'R' THEN res.votes ELSE 0 END) as rep_votes,
+            SUM(CASE WHEN c.party IN ('D', 'R') THEN res.votes ELSE 0 END) as dr_total
+        FROM results res
+        JOIN races r ON res.race_id = r.id
+        JOIN candidates c ON res.candidate_id = c.id
+        JOIN elections e ON r.election_id = e.id
+        JOIN precincts p ON res.precinct_id = p.id
+        WHERE r.race_name LIKE '%President%'
+          AND c.party IN ('D', 'R')
+          AND e.election_type = 'general'
+          AND res.precinct_id IS NOT NULL
+        GROUP BY UPPER(p.precinct_name), e.election_date
+        HAVING dr_total > 0
+    """
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+
+    if df.empty:
+        return df
+
+    df["d_share"] = (df["dem_votes"] / df["dr_total"] * 100).round(2)
+
+    # County average D share per presidential election
+    county_avg = df.groupby("election_date")["d_share"].mean().reset_index()
+    county_avg.columns = ["election_date", "county_d_share"]
+
+    # Merge and compute deviation
+    merged = df.merge(county_avg, on="election_date")
+    merged["deviation"] = merged["d_share"] - merged["county_d_share"]
+
+    # Average deviation across all presidential elections = PVI
+    pvi = merged.groupby("precinct").agg(
+        pvi=("deviation", "mean"),
+        avg_d_share=("d_share", "mean"),
+        elections_counted=("election_date", "nunique"),
+    ).reset_index()
+
+    pvi["pvi"] = pvi["pvi"].round(1)
+    pvi["avg_d_share"] = pvi["avg_d_share"].round(2)
+    pvi["pvi_label"] = pvi["pvi"].apply(
+        lambda x: f"D+{abs(x):.1f}" if x >= 0 else f"R+{abs(x):.1f}"
+    )
+
+    return pvi.sort_values("pvi", ascending=False)
+
+
+def get_surge_voter_analysis(db_path=None):
+    """
+    Track registration growth per precinct vs D share change.
+    Identifies 'Growing + Bluing' precincts = long-term investments.
+    """
+    conn = get_connection(db_path)
+
+    turnout_query = """
+        SELECT
+            UPPER(p.precinct_name) as precinct,
+            e.election_date,
+            MAX(t.registered_voters) as registered_voters
+        FROM turnout t
+        JOIN elections e ON t.election_id = e.id
+        JOIN precincts p ON t.precinct_id = p.id
+        WHERE t.precinct_id IS NOT NULL
+          AND t.registered_voters > 0
+        GROUP BY UPPER(p.precinct_name), e.election_date
+        ORDER BY UPPER(p.precinct_name), e.election_date
+    """
+    turnout_df = pd.read_sql_query(turnout_query, conn)
+    conn.close()
+
+    if turnout_df.empty:
+        return pd.DataFrame()
+
+    # Get D share base data
+    base = _get_precinct_dem_share_base(db_path)
+    if base.empty:
+        return pd.DataFrame()
+
+    # Compute growth: earliest vs latest registered_voters
+    growth_rows = []
+    for precinct, group in turnout_df.sort_values("election_date").groupby("precinct"):
+        if len(group) < 2:
+            continue
+        earliest_reg = group.iloc[0]["registered_voters"]
+        latest_reg = group.iloc[-1]["registered_voters"]
+        earliest_date = group.iloc[0]["election_date"]
+        latest_date = group.iloc[-1]["election_date"]
+
+        reg_growth_pct = round((latest_reg - earliest_reg) / earliest_reg * 100, 2) if earliest_reg > 0 else 0.0
+
+        # Get D share change for same precinct
+        pct_base = base[base["precinct"] == precinct].sort_values("election_date")
+        if len(pct_base) < 2:
+            d_share_change = 0.0
+        else:
+            d_share_change = round(float(pct_base.iloc[-1]["d_share"] - pct_base.iloc[0]["d_share"]), 2)
+
+        growth_rows.append({
+            "precinct": precinct,
+            "earliest_registered": int(earliest_reg),
+            "latest_registered": int(latest_reg),
+            "reg_growth_pct": reg_growth_pct,
+            "d_share_change": d_share_change,
+            "earliest_date": earliest_date,
+            "latest_date": latest_date,
+        })
+
+    result = pd.DataFrame(growth_rows)
+    if result.empty:
+        return result
+
+    # Assign quadrants
+    med_growth = result["reg_growth_pct"].median()
+    med_d_change = result["d_share_change"].median()
+
+    def assign_quadrant(row):
+        growing = row["reg_growth_pct"] >= med_growth
+        bluing = row["d_share_change"] >= med_d_change
+        if growing and bluing:
+            return "Growing + Bluing"
+        elif growing and not bluing:
+            return "Growing + Reddening"
+        elif not growing and bluing:
+            return "Stable + Bluing"
+        else:
+            return "Stable + Reddening"
+
+    result["quadrant"] = result.apply(assign_quadrant, axis=1)
+    result.attrs["median_growth"] = med_growth
+    result.attrs["median_d_change"] = med_d_change
+
+    return result
+
+
+def get_uncontested_race_mapping(db_path=None):
+    """
+    Map contested vs uncontested races per election.
+    For uncontested R races, estimate latent D support from
+    contested races at the same level in the same election.
+    Returns (summary_pivot, uncontested_r_detail).
+    """
+    conn = get_connection(db_path)
+
+    # Identify contested vs uncontested races
+    query = """
+        SELECT
+            r.id as race_id,
+            r.race_name,
+            r.race_level,
+            e.election_date,
+            e.election_type,
+            GROUP_CONCAT(DISTINCT c.party) as parties
+        FROM races r
+        JOIN results res ON res.race_id = r.id
+        JOIN candidates c ON res.candidate_id = c.id
+        JOIN elections e ON r.election_id = e.id
+        WHERE r.race_level IN ('federal', 'state', 'county', 'local')
+          AND e.election_type = 'general'
+          AND c.party IN ('D', 'R')
+        GROUP BY r.id
+    """
+    races_df = pd.read_sql_query(query, conn)
+
+    if races_df.empty:
+        conn.close()
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Classify each race
+    races_df["status"] = races_df["parties"].apply(
+        lambda p: "Contested" if "D" in str(p) and "R" in str(p)
+        else ("Uncontested D" if "D" in str(p) else "Uncontested R")
+    )
+
+    # Summary: contested vs uncontested by election year
+    summary = races_df.groupby(["election_date", "status"]).size().reset_index(name="count")
+    summary_pivot = summary.pivot_table(
+        index="election_date", columns="status", values="count", fill_value=0
+    ).reset_index()
+
+    # For uncontested R races, estimate latent D support
+    uncontested_r = races_df[races_df["status"] == "Uncontested R"].copy()
+
+    if not uncontested_r.empty:
+        # Get D share from contested races per election per race_level
+        contested_share_query = """
+            SELECT
+                e.election_date,
+                r.race_level,
+                SUM(CASE WHEN c.party = 'D' THEN res.votes ELSE 0 END) as d_votes,
+                SUM(CASE WHEN c.party IN ('D','R') THEN res.votes ELSE 0 END) as dr_total
+            FROM results res
+            JOIN races r ON res.race_id = r.id
+            JOIN candidates c ON res.candidate_id = c.id
+            JOIN elections e ON r.election_id = e.id
+            WHERE r.race_level IN ('federal', 'state', 'county', 'local')
+              AND e.election_type = 'general'
+              AND c.party IN ('D', 'R')
+              AND r.id IN (
+                  SELECT r2.id FROM races r2
+                  JOIN results res2 ON res2.race_id = r2.id
+                  JOIN candidates c2 ON res2.candidate_id = c2.id
+                  WHERE c2.party IN ('D','R')
+                  GROUP BY r2.id
+                  HAVING COUNT(DISTINCT c2.party) = 2
+              )
+            GROUP BY e.election_date, r.race_level
+            HAVING dr_total > 0
+        """
+        contested_shares = pd.read_sql_query(contested_share_query, conn)
+        if not contested_shares.empty:
+            contested_shares["baseline_d_share"] = (
+                contested_shares["d_votes"] / contested_shares["dr_total"] * 100
+            ).round(2)
+
+            # Get total votes for uncontested R races
+            unc_race_ids = ",".join(str(x) for x in uncontested_r["race_id"].tolist())
+            unc_votes_query = f"""
+                SELECT r.id as race_id, SUM(res.votes) as total_votes
+                FROM results res
+                JOIN races r ON res.race_id = r.id
+                WHERE r.id IN ({unc_race_ids})
+                GROUP BY r.id
+            """
+            unc_votes = pd.read_sql_query(unc_votes_query, conn)
+
+            uncontested_r = uncontested_r.merge(unc_votes, on="race_id", how="left")
+            uncontested_r = uncontested_r.merge(
+                contested_shares[["election_date", "race_level", "baseline_d_share"]],
+                on=["election_date", "race_level"],
+                how="left"
+            )
+            uncontested_r["estimated_latent_d_votes"] = (
+                uncontested_r["total_votes"].fillna(0) * uncontested_r["baseline_d_share"].fillna(0) / 100
+            ).round(0)
+
+    conn.close()
+    return summary_pivot, uncontested_r.sort_values(
+        "estimated_latent_d_votes", ascending=False
+    ) if not uncontested_r.empty else (summary_pivot, pd.DataFrame())
+
+
+def get_third_party_persuadability(db_path=None):
+    """
+    Track L/I/WTP third-party vote share per precinct in general elections.
+    Flags 'flippable' precincts where third-party vote exceeds D-R margin.
+    Returns (aggregate_df, detail_df).
+    """
+    conn = get_connection(db_path)
+    query = """
+        SELECT
+            UPPER(p.precinct_name) as precinct,
+            e.election_date,
+            SUM(CASE WHEN c.party = 'D' THEN res.votes ELSE 0 END) as dem_votes,
+            SUM(CASE WHEN c.party = 'R' THEN res.votes ELSE 0 END) as rep_votes,
+            SUM(CASE WHEN c.party IN ('L', 'I', 'WTP')
+                THEN res.votes ELSE 0 END) as third_party_votes,
+            SUM(res.votes) as total_votes
+        FROM results res
+        JOIN races r ON res.race_id = r.id
+        JOIN candidates c ON res.candidate_id = c.id
+        JOIN elections e ON r.election_id = e.id
+        JOIN precincts p ON res.precinct_id = p.id
+        WHERE e.election_type = 'general'
+          AND r.race_name <> 'Straight Party'
+          AND r.race_level IN ('federal', 'state', 'county', 'local')
+          AND res.precinct_id IS NOT NULL
+        GROUP BY UPPER(p.precinct_name), e.election_date
+    """
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    df = df[df["total_votes"] > 0].copy()
+    df["third_party_pct"] = (df["third_party_votes"] / df["total_votes"] * 100).round(2)
+    df["dr_margin"] = ((df["dem_votes"] - df["rep_votes"]) / df["total_votes"] * 100).round(2)
+    df["margin_abs"] = df["dr_margin"].abs()
+    df["flippable"] = df["third_party_pct"] > df["margin_abs"]
+
+    # Aggregate across elections
+    agg = df.groupby("precinct").agg(
+        avg_third_party_pct=("third_party_pct", "mean"),
+        avg_margin=("dr_margin", "mean"),
+        flippable_elections=("flippable", "sum"),
+        total_elections=("election_date", "nunique"),
+    ).reset_index()
+
+    agg["avg_third_party_pct"] = agg["avg_third_party_pct"].round(2)
+    agg["avg_margin"] = agg["avg_margin"].round(2)
+    agg = agg.sort_values("avg_third_party_pct", ascending=False)
+
+    return agg, df
+
+
+def get_rolloff_analysis(db_path=None):
+    """
+    Computes ballot rolloff: voters who cast a ballot but skip a race.
+    rolloff = (ballots_cast - race_votes) / ballots_cast per precinct per election.
+    Returns (avg_rolloff_df, heatmap_df).
+    """
+    conn = get_connection(db_path)
+
+    turnout_query = """
+        SELECT
+            UPPER(p.precinct_name) as precinct,
+            e.election_date,
+            MAX(t.ballots_cast) as ballots_cast
+        FROM turnout t
+        JOIN elections e ON t.election_id = e.id
+        JOIN precincts p ON t.precinct_id = p.id
+        WHERE t.precinct_id IS NOT NULL
+          AND t.ballots_cast > 0
+        GROUP BY UPPER(p.precinct_name), e.election_date
+    """
+    turnout_df = pd.read_sql_query(turnout_query, conn)
+
+    votes_query = """
+        SELECT
+            UPPER(p.precinct_name) as precinct,
+            e.election_date,
+            r.race_name,
+            r.race_level,
+            SUM(res.votes) as race_total_votes
+        FROM results res
+        JOIN races r ON res.race_id = r.id
+        JOIN elections e ON r.election_id = e.id
+        JOIN precincts p ON res.precinct_id = p.id
+        WHERE res.precinct_id IS NOT NULL
+          AND r.race_name <> 'Straight Party'
+          AND r.race_level IN ('federal', 'state', 'county', 'local')
+        GROUP BY UPPER(p.precinct_name), e.election_date, r.id
+    """
+    votes_df = pd.read_sql_query(votes_query, conn)
+    conn.close()
+
+    if turnout_df.empty or votes_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Merge to get ballots_cast alongside race votes
+    merged = votes_df.merge(turnout_df, on=["precinct", "election_date"], how="inner")
+
+    # Compute rolloff per race, clamp at 0 (multi-vote races can exceed ballots_cast)
+    merged["rolloff"] = (
+        (merged["ballots_cast"] - merged["race_total_votes"])
+        / merged["ballots_cast"] * 100
+    ).round(2)
+    merged["rolloff"] = merged["rolloff"].clip(lower=0)
+
+    # Average rolloff per precinct per election
+    avg_rolloff = merged.groupby(["precinct", "election_date"]).agg(
+        avg_rolloff=("rolloff", "mean"),
+        max_rolloff=("rolloff", "max"),
+        races_counted=("race_name", "nunique"),
+    ).reset_index()
+    avg_rolloff["avg_rolloff"] = avg_rolloff["avg_rolloff"].round(2)
+
+    # Pivot for heatmap
+    heatmap = avg_rolloff.pivot_table(
+        index="precinct",
+        columns="election_date",
+        values="avg_rolloff",
+        aggfunc="first"
+    )
+    heatmap["_avg"] = heatmap.mean(axis=1)
+    heatmap = heatmap.sort_values("_avg", ascending=False)
+    heatmap = heatmap.drop(columns=["_avg"])
+
+    return avg_rolloff, heatmap
+
+
+def get_straight_ticket_geography(db_path=None):
+    """
+    Straight-ticket D votes as % of total D votes per precinct per election.
+    Classifies: Brand-Dependent (>=40%), Mixed (20-40%), Candidate-Dependent (<20%).
+    """
+    conn = get_connection(db_path)
+
+    query = """
+        SELECT
+            UPPER(p.precinct_name) as precinct,
+            e.election_date,
+            SUM(CASE WHEN r.race_name = 'Straight Party' AND c.party = 'D'
+                THEN res.votes ELSE 0 END) as straight_d_votes,
+            SUM(CASE WHEN c.party = 'D'
+                THEN res.votes ELSE 0 END) as total_d_votes
+        FROM results res
+        JOIN races r ON res.race_id = r.id
+        JOIN candidates c ON res.candidate_id = c.id
+        JOIN elections e ON r.election_id = e.id
+        JOIN precincts p ON res.precinct_id = p.id
+        WHERE res.precinct_id IS NOT NULL
+          AND e.election_type = 'general'
+        GROUP BY UPPER(p.precinct_name), e.election_date
+        HAVING total_d_votes > 0
+    """
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+
+    if df.empty:
+        return df
+
+    df["straight_d_pct_of_total"] = (
+        df["straight_d_votes"] / df["total_d_votes"] * 100
+    ).round(2)
+
+    df["dependency"] = df["straight_d_pct_of_total"].apply(
+        lambda x: "Brand-Dependent" if x >= 40 else (
+            "Mixed" if x >= 20 else "Candidate-Dependent"
+        )
+    )
+
+    return df
+
+
+def get_headline_kpis(db_path=None):
+    """
+    Generate headline KPIs with deltas comparing latest vs prior general election.
+    Returns dict with D share, turnout, straight-ticket D%, contested race counts.
+    """
+    conn = get_connection(db_path)
+
+    elections_query = """
+        SELECT DISTINCT election_date FROM elections
+        WHERE election_type = 'general'
+        ORDER BY election_date DESC LIMIT 2
+    """
+    elections = pd.read_sql_query(elections_query, conn)
+
+    if len(elections) < 2:
+        conn.close()
+        return {}
+
+    latest = elections.iloc[0]["election_date"]
+    prior = elections.iloc[1]["election_date"]
+
+    # D vote share
+    share_query = """
+        SELECT
+            e.election_date,
+            SUM(CASE WHEN c.party = 'D' THEN res.votes ELSE 0 END) as dem_votes,
+            SUM(CASE WHEN c.party IN ('D', 'R') THEN res.votes ELSE 0 END) as dr_total
+        FROM results res
+        JOIN races r ON res.race_id = r.id
+        JOIN candidates c ON res.candidate_id = c.id
+        JOIN elections e ON r.election_id = e.id
+        WHERE e.election_date IN (?, ?)
+          AND c.party IN ('D', 'R')
+          AND r.race_level IN ('federal', 'state', 'county', 'local')
+        GROUP BY e.election_date
+    """
+    share_df = pd.read_sql_query(share_query, conn, params=[latest, prior])
+
+    # Turnout
+    turnout_query = """
+        SELECT
+            e.election_date,
+            AVG(t.turnout_percentage) as avg_turnout
+        FROM turnout t
+        JOIN elections e ON t.election_id = e.id
+        WHERE e.election_date IN (?, ?)
+          AND t.precinct_id IS NOT NULL
+          AND t.turnout_percentage > 0 AND t.turnout_percentage <= 100
+        GROUP BY e.election_date
+    """
+    turnout_df = pd.read_sql_query(turnout_query, conn, params=[latest, prior])
+
+    # Straight-ticket D%
+    straight_query = """
+        SELECT
+            e.election_date,
+            SUM(CASE WHEN c.party = 'D' THEN res.votes ELSE 0 END) as d_straight,
+            SUM(res.votes) as total_straight
+        FROM results res
+        JOIN races r ON res.race_id = r.id
+        JOIN candidates c ON res.candidate_id = c.id
+        JOIN elections e ON r.election_id = e.id
+        WHERE r.race_name = 'Straight Party'
+          AND c.party IN ('D', 'R')
+          AND e.election_date IN (?, ?)
+        GROUP BY e.election_date
+    """
+    straight_df = pd.read_sql_query(straight_query, conn, params=[latest, prior])
+
+    # D contested races
+    contested_query = """
+        SELECT
+            e.election_date,
+            COUNT(DISTINCT r.id) as d_contested
+        FROM races r
+        JOIN results res ON res.race_id = r.id
+        JOIN candidates c ON res.candidate_id = c.id
+        JOIN elections e ON r.election_id = e.id
+        WHERE c.party = 'D'
+          AND e.election_date IN (?, ?)
+          AND r.race_level IN ('federal', 'state', 'county', 'local')
+        GROUP BY e.election_date
+    """
+    contested_df = pd.read_sql_query(contested_query, conn, params=[latest, prior])
+
+    conn.close()
+
+    # Build KPI dict
+    kpis = {"latest_election": latest, "prior_election": prior}
+
+    for _, row in share_df.iterrows():
+        d_share = round(row["dem_votes"] / row["dr_total"] * 100, 1) if row["dr_total"] > 0 else 0
+        if row["election_date"] == latest:
+            kpis["d_share_latest"] = d_share
+        else:
+            kpis["d_share_prior"] = d_share
+    kpis["d_share_delta"] = round(kpis.get("d_share_latest", 0) - kpis.get("d_share_prior", 0), 1)
+
+    for _, row in turnout_df.iterrows():
+        if row["election_date"] == latest:
+            kpis["turnout_latest"] = round(row["avg_turnout"], 1)
+        else:
+            kpis["turnout_prior"] = round(row["avg_turnout"], 1)
+    kpis["turnout_delta"] = round(kpis.get("turnout_latest", 0) - kpis.get("turnout_prior", 0), 1)
+
+    for _, row in straight_df.iterrows():
+        d_pct = round(row["d_straight"] / row["total_straight"] * 100, 1) if row["total_straight"] > 0 else 0
+        if row["election_date"] == latest:
+            kpis["straight_d_pct_latest"] = d_pct
+        else:
+            kpis["straight_d_pct_prior"] = d_pct
+    kpis["straight_d_delta"] = round(
+        kpis.get("straight_d_pct_latest", 0) - kpis.get("straight_d_pct_prior", 0), 1
+    )
+
+    for _, row in contested_df.iterrows():
+        if row["election_date"] == latest:
+            kpis["d_contested_latest"] = int(row["d_contested"])
+        else:
+            kpis["d_contested_prior"] = int(row["d_contested"])
+    kpis["d_contested_delta"] = kpis.get("d_contested_latest", 0) - kpis.get("d_contested_prior", 0)
+
+    return kpis
+
+
+def get_top_opportunities(db_path=None):
+    """
+    Auto-generate top 3 strategic opportunities by synthesizing other analyses.
+    Returns list of dicts: [{"title": str, "detail": str, "source": str}, ...]
+    """
+    opportunities = []
+
+    # 1: Best mobilization goldmine precinct
+    try:
+        turnout_dem = get_turnout_vs_dem_share(db_path=db_path)
+        if not turnout_dem.empty:
+            goldmines = turnout_dem[turnout_dem["quadrant"] == "Mobilization Goldmine"]
+            if not goldmines.empty:
+                top = goldmines.sort_values("potential_votes_gained", ascending=False).iloc[0]
+                opportunities.append({
+                    "title": f"Mobilize {top['precinct']}",
+                    "detail": (
+                        f"Turnout {top['avg_turnout']:.0f}% with {top['avg_d_share']:.0f}% D share. "
+                        f"Potential gain: ~{top['potential_votes_gained']:.0f} votes."
+                    ),
+                    "source": "Turnout Opportunities",
+                })
+    except Exception:
+        pass
+
+    # 2: Highest volatility D-leaning precinct
+    try:
+        volatility = get_precinct_volatility(db_path=db_path)
+        if not volatility.empty:
+            persuadable = volatility[volatility["avg_d_share"] >= 35].head(1)
+            if not persuadable.empty:
+                top = persuadable.iloc[0]
+                opportunities.append({
+                    "title": f"Persuade in {top['precinct']}",
+                    "detail": (
+                        f"Volatility: {top['volatility']:.1f} pp swing/election. "
+                        f"Currently {top['latest_d_share']:.0f}% D -- winnable with engagement."
+                    ),
+                    "source": "Precinct Volatility",
+                })
+    except Exception:
+        pass
+
+    # 3: Best uncontested R seat to contest
+    try:
+        _, uncontested_detail = get_uncontested_race_mapping(db_path=db_path)
+        if not uncontested_detail.empty and "estimated_latent_d_votes" in uncontested_detail.columns:
+            latest_unc = uncontested_detail[
+                uncontested_detail["election_date"] == uncontested_detail["election_date"].max()
+            ]
+            if not latest_unc.empty:
+                top = latest_unc.sort_values("estimated_latent_d_votes", ascending=False).iloc[0]
+                if pd.notna(top.get("estimated_latent_d_votes", None)):
+                    opportunities.append({
+                        "title": f"Contest {top['race_name']}",
+                        "detail": (
+                            f"Uncontested R in {top['election_date']}. "
+                            f"Est. latent D support: ~{top['estimated_latent_d_votes']:.0f} votes."
+                        ),
+                        "source": "Uncontested Race Mapping",
+                    })
+    except Exception:
+        pass
+
+    # 4 (fallback): Fastest-growing D-trending precinct
+    if len(opportunities) < 3:
+        try:
+            surge = get_surge_voter_analysis(db_path=db_path)
+            if not surge.empty:
+                growing_blue = surge[surge["quadrant"] == "Growing + Bluing"]
+                if not growing_blue.empty:
+                    top = growing_blue.sort_values("reg_growth_pct", ascending=False).iloc[0]
+                    opportunities.append({
+                        "title": f"Invest in {top['precinct']}",
+                        "detail": (
+                            f"Registration up {top['reg_growth_pct']:.0f}% and D share "
+                            f"shifted +{top['d_share_change']:.1f} pp. A growing base."
+                        ),
+                        "source": "Growth Analysis",
+                    })
+        except Exception:
+            pass
+
+    return opportunities[:3]
+
+
+def get_election_overview(db_path=None):
+    """
+    Get a summary overview of all elections for the Data Explorer tab.
+    Returns one row per election with counts and quality scores.
+    """
+    conn = get_connection(db_path)
+
+    query = """
+        SELECT
+            e.id as election_id,
+            e.election_date,
+            e.election_type,
+            e.election_name,
+            COUNT(DISTINCT r.id) as race_count,
+            COUNT(DISTINCT res.id) as result_count,
+            COUNT(DISTINCT res.precinct_id) as precinct_count,
+            COALESCE(t_sub.turnout_precincts, 0) as turnout_precincts,
+            COALESCE(dq.overall_confidence, 'not assessed') as confidence_level,
+            COALESCE(dq.confidence_score, 0.0) as confidence_score,
+            dq.source_type,
+            dq.cross_validated,
+            dq.race_names_clean,
+            dq.turnout_consistent,
+            dq.precinct_count_match,
+            dq.notes as quality_notes
+        FROM elections e
+        LEFT JOIN races r ON r.election_id = e.id
+        LEFT JOIN results res ON res.race_id = r.id
+        LEFT JOIN data_quality dq ON dq.election_id = e.id
+        LEFT JOIN (
+            SELECT election_id, COUNT(DISTINCT precinct_id) as turnout_precincts
+            FROM turnout
+            GROUP BY election_id
+        ) t_sub ON t_sub.election_id = e.id
+        GROUP BY e.id
+        ORDER BY e.election_date
+    """
+
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
 
 
 def export_analysis_to_excel(output_path=None, db_path=None):

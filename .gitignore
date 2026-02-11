@@ -5,5 +5,12 @@ __pycache__/
 *.egg-info/
 data/raw_pdfs/
 data/processed/
+data/*_backup*.db
 exports/
 .streamlit/secrets.toml
+~$*
+*.xlsx
+*.docx
+*.pdf
+generate_docx.py
+RESEARCH_REPORT.md
