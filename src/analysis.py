@@ -1350,6 +1350,121 @@ def get_election_overview(db_path=None):
     return df
 
 
+def get_area_election_summary(db_path=None):
+    """
+    Aggregate election results to geographic area level for correlation
+    with Census demographics. Maps precincts to areas using name prefixes.
+
+    Returns DataFrame with: area, avg_d_share, avg_turnout, elections_counted
+    """
+    conn = get_connection(db_path)
+
+    # Get precinct-level D share across all general elections
+    query = """
+        SELECT
+            p.precinct_name,
+            e.election_date,
+            e.election_type,
+            SUM(CASE WHEN c.party = 'D' THEN res.votes ELSE 0 END) as d_votes,
+            SUM(CASE WHEN c.party = 'R' THEN res.votes ELSE 0 END) as r_votes,
+            SUM(res.votes) as total_votes
+        FROM results res
+        JOIN races r ON res.race_id = r.id
+        JOIN candidates c ON res.candidate_id = c.id
+        JOIN elections e ON r.election_id = e.id
+        JOIN precincts p ON res.precinct_id = p.id
+        WHERE e.election_type = 'general'
+          AND c.party IN ('D', 'R')
+          AND r.race_level IN ('federal', 'state', 'county')
+        GROUP BY p.precinct_name, e.election_date
+    """
+    df = pd.read_sql_query(query, conn)
+
+    # Get turnout data
+    turnout_query = """
+        SELECT
+            p.precinct_name,
+            AVG(t.turnout_percentage) as avg_turnout
+        FROM turnout t
+        JOIN elections e ON t.election_id = e.id
+        JOIN precincts p ON t.precinct_id = p.id
+        WHERE e.election_type = 'general'
+          AND t.turnout_percentage > 0
+          AND t.turnout_percentage <= 100
+        GROUP BY p.precinct_name
+    """
+    turnout_df = pd.read_sql_query(turnout_query, conn)
+    conn.close()
+
+    if df.empty:
+        return pd.DataFrame()
+
+    # Map precincts to areas
+    precinct_area_map = {
+        "CENTER": "Lebanon",
+        "JEFFERSON": "Lebanon",
+        "WASHINGTON": "Lebanon",
+        "EAGLE": "Zionsville/Whitestown",
+        "JACKSON": "Rural West",
+        "MARION": "Rural East",
+        "PERRY": "Central Rural",
+        "SUGAR CREEK": "Rural West",
+        "UNION": "Rural West",
+        "WORTH": "Rural West",
+        "CLINTON": "Rural East",
+        "HARRISON": "Rural East",
+        "PRECINCT": "Unknown",  # Generic precinct names from some elections
+    }
+
+    def map_precinct_to_area(name):
+        upper = name.upper().strip()
+        # Strip leading numbers and dashes (e.g., "001-CENTER 1" → "CENTER")
+        import re
+        cleaned = re.sub(r'^\d+-', '', upper).strip()
+        # Find matching prefix
+        for prefix, area in precinct_area_map.items():
+            if cleaned.startswith(prefix):
+                return area
+        return "Unknown"
+
+    df["area"] = df["precinct_name"].apply(map_precinct_to_area)
+    df["d_share"] = np.where(
+        (df["d_votes"] + df["r_votes"]) > 0,
+        df["d_votes"] / (df["d_votes"] + df["r_votes"]) * 100,
+        np.nan
+    )
+
+    # Also map turnout
+    if not turnout_df.empty:
+        turnout_df["area"] = turnout_df["precinct_name"].apply(map_precinct_to_area)
+
+    # Aggregate to area level
+    area_election = df[df["area"] != "Unknown"].groupby("area").agg(
+        avg_d_share=("d_share", "mean"),
+        total_d_votes=("d_votes", "sum"),
+        total_r_votes=("r_votes", "sum"),
+        total_votes=("total_votes", "sum"),
+        elections_counted=("election_date", "nunique"),
+        precincts=("precinct_name", "nunique"),
+    ).reset_index()
+
+    area_election["avg_d_share"] = area_election["avg_d_share"].round(1)
+    area_election["overall_d_share"] = (
+        area_election["total_d_votes"] /
+        (area_election["total_d_votes"] + area_election["total_r_votes"]) * 100
+    ).round(1)
+
+    # Add turnout
+    if not turnout_df.empty:
+        area_turnout = turnout_df[turnout_df["area"] != "Unknown"].groupby("area").agg(
+            avg_turnout=("avg_turnout", "mean"),
+        ).reset_index()
+        area_turnout["avg_turnout"] = area_turnout["avg_turnout"].round(1)
+        area_election = area_election.merge(area_turnout, on="area", how="left")
+
+    return area_election
+
+
 def export_analysis_to_excel(output_path=None, db_path=None):
     """
     Export all key analyses to a single Excel workbook.

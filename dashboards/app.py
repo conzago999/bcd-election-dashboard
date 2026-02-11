@@ -36,7 +36,9 @@ from analysis import (
     get_headline_kpis,
     get_top_opportunities,
     get_election_overview,
+    get_area_election_summary,
 )
+from census_acs import get_area_demographics, get_tract_detail
 
 st.set_page_config(
     page_title="BCD Election Data",
@@ -114,12 +116,13 @@ DEPENDENCY_COLORS = {
 # ============================================================
 # TABS (4 tabs)
 # ============================================================
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "The Big Picture",
     "Precinct Intel",
     "Where to Win",
     "Voting Patterns",
     "Data Explorer",
+    "Demographics",
 ])
 
 # ============================================================
@@ -1307,6 +1310,298 @@ with tab5:
             st.dataframe(import_log, use_container_width=True, hide_index=True)
         else:
             st.info("No import records found.")
+
+
+# ============================================================
+# TAB 6: DEMOGRAPHICS
+# ============================================================
+with tab6:
+    st.header("Demographics")
+    st.markdown("*Census data correlated with voting patterns — what drives Democratic performance?*")
+
+    # Load Census API key
+    census_api_key = None
+    try:
+        census_api_key = st.secrets["census"]["api_key"]
+    except Exception:
+        # Try environment variable as fallback
+        census_api_key = os.environ.get("CENSUS_API_KEY")
+
+    if not census_api_key:
+        st.warning("Census API key not configured. Add it to `.streamlit/secrets.toml` under `[census]`.")
+        st.code('[census]\napi_key = "your_key_here"', language="toml")
+        st.stop()
+
+    demo_section = st.radio(
+        "Section",
+        ["Community Profile", "Demographics vs. Voting", "Tract Detail"],
+        horizontal=True,
+        key="demo_section"
+    )
+
+    # --- Community Profile ---
+    if demo_section == "Community Profile":
+        st.subheader("Boone County Community Profile")
+        st.markdown("*Census ACS 5-Year estimates aggregated to geographic areas*")
+
+        @st.cache_data(ttl=86400)
+        def load_area_demographics(key):
+            return get_area_demographics(key)
+
+        area_demo = load_area_demographics(census_api_key)
+
+        if not area_demo.empty:
+            # KPI cards
+            total_pop = area_demo["population"].sum()
+            avg_income = int((area_demo["median_income"] * area_demo["population"] / total_pop).sum())
+            avg_ed = round((area_demo["pct_bachelors"] * area_demo["population"] / total_pop).sum(), 1)
+
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("County Population", f"{total_pop:,}")
+            col2.metric("Avg Median Income", f"${avg_income:,}")
+            col3.metric("Avg % Bachelor's+", f"{avg_ed}%")
+            col4.metric("Geographic Areas", len(area_demo))
+
+            st.divider()
+
+            # Side-by-side bar charts
+            col_left, col_right = st.columns(2)
+
+            with col_left:
+                fig_income = px.bar(
+                    area_demo.sort_values("median_income"),
+                    x="median_income",
+                    y="area",
+                    orientation="h",
+                    color="median_income",
+                    color_continuous_scale=["#f39c12", "#27ae60"],
+                    title="Median Household Income by Area",
+                    labels={"median_income": "Median Income", "area": ""},
+                )
+                fig_income.update_layout(height=350, showlegend=False)
+                st.plotly_chart(fig_income, use_container_width=True)
+
+            with col_right:
+                fig_ed = px.bar(
+                    area_demo.sort_values("pct_bachelors"),
+                    x="pct_bachelors",
+                    y="area",
+                    orientation="h",
+                    color="pct_bachelors",
+                    color_continuous_scale=["#e74c3c", "#3498db"],
+                    title="% with Bachelor's Degree or Higher",
+                    labels={"pct_bachelors": "% Bachelor's+", "area": ""},
+                )
+                fig_ed.update_layout(height=350, showlegend=False)
+                st.plotly_chart(fig_ed, use_container_width=True)
+
+            col_left2, col_right2 = st.columns(2)
+
+            with col_left2:
+                fig_age = px.bar(
+                    area_demo.sort_values("median_age"),
+                    x="median_age",
+                    y="area",
+                    orientation="h",
+                    color="median_age",
+                    color_continuous_scale=["#3498db", "#8e44ad"],
+                    title="Median Age by Area",
+                    labels={"median_age": "Median Age", "area": ""},
+                )
+                fig_age.update_layout(height=350, showlegend=False)
+                st.plotly_chart(fig_age, use_container_width=True)
+
+            with col_right2:
+                fig_home = px.bar(
+                    area_demo.sort_values("median_home_value"),
+                    x="median_home_value",
+                    y="area",
+                    orientation="h",
+                    color="median_home_value",
+                    color_continuous_scale=["#95a5a6", "#2ecc71"],
+                    title="Median Home Value by Area",
+                    labels={"median_home_value": "Median Home Value", "area": ""},
+                )
+                fig_home.update_layout(height=350, showlegend=False)
+                st.plotly_chart(fig_home, use_container_width=True)
+
+            # Full data table
+            with st.expander("View full area demographics data"):
+                display_demo = area_demo.copy()
+                display_demo["median_income"] = display_demo["median_income"].apply(lambda x: f"${x:,}")
+                display_demo["median_home_value"] = display_demo["median_home_value"].apply(lambda x: f"${x:,}")
+                display_demo["population"] = display_demo["population"].apply(lambda x: f"{x:,}")
+                st.dataframe(display_demo, use_container_width=True, hide_index=True)
+
+            st.caption("Source: U.S. Census Bureau, ACS 5-Year Estimates (2022). "
+                       "Areas are aggregations of census tracts mapped to Boone County geographic regions.")
+        else:
+            st.error("Failed to load Census data. Check your API key.")
+
+    # --- Demographics vs. Voting ---
+    elif demo_section == "Demographics vs. Voting":
+        st.subheader("Demographics vs. Voting Patterns")
+        st.markdown("*How do community characteristics correlate with Democratic performance?*")
+
+        @st.cache_data(ttl=86400)
+        def load_demo_voting(key):
+            demos = get_area_demographics(key)
+            votes = get_area_election_summary()
+            if demos.empty or votes.empty:
+                return pd.DataFrame()
+            merged = demos.merge(votes, on="area", how="inner")
+            return merged
+
+        merged = load_demo_voting(census_api_key)
+
+        if not merged.empty and len(merged) >= 3:
+            # Variable selector
+            demo_variables = {
+                "Median Income": "median_income",
+                "% Bachelor's Degree": "pct_bachelors",
+                "Median Age": "median_age",
+                "% Homeowner": "pct_owner_occupied",
+                "Median Home Value": "median_home_value",
+                "% White": "pct_white",
+                "% Age 65+": "pct_65plus",
+            }
+
+            selected_var = st.selectbox(
+                "Demographic variable to compare",
+                list(demo_variables.keys()),
+                key="demo_variable"
+            )
+            var_col = demo_variables[selected_var]
+
+            # Main scatter: demographic vs D share
+            fig = px.scatter(
+                merged,
+                x=var_col,
+                y="overall_d_share",
+                text="area",
+                size="population",
+                color="overall_d_share",
+                color_continuous_scale=["#e74c3c", "#f39c12", "#3498db"],
+                title=f"{selected_var} vs. Democratic Vote Share by Area",
+                labels={var_col: selected_var, "overall_d_share": "D Vote Share %"},
+                trendline="ols",
+            )
+            fig.update_traces(textposition="top center", textfont_size=10)
+            fig.update_layout(height=500, showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Compute correlation
+            corr = merged[var_col].corr(merged["overall_d_share"])
+            direction = "positive" if corr > 0 else "negative"
+            strength = "strong" if abs(corr) > 0.7 else "moderate" if abs(corr) > 0.4 else "weak"
+
+            st.info(f"**Correlation: r = {corr:.2f}** ({strength} {direction}) — "
+                    f"Areas with higher {selected_var.lower()} tend to have "
+                    f"{'higher' if corr > 0 else 'lower'} Democratic vote share.")
+
+            # Secondary scatter: demographic vs turnout (if available)
+            if "avg_turnout" in merged.columns and merged["avg_turnout"].notna().any():
+                fig2 = px.scatter(
+                    merged,
+                    x=var_col,
+                    y="avg_turnout",
+                    text="area",
+                    size="population",
+                    color="avg_turnout",
+                    color_continuous_scale=["#e74c3c", "#f39c12", "#2ecc71"],
+                    title=f"{selected_var} vs. Average Turnout by Area",
+                    labels={var_col: selected_var, "avg_turnout": "Avg Turnout %"},
+                    trendline="ols",
+                )
+                fig2.update_traces(textposition="top center", textfont_size=10)
+                fig2.update_layout(height=500, showlegend=False)
+                st.plotly_chart(fig2, use_container_width=True)
+
+                corr2 = merged[var_col].corr(merged["avg_turnout"])
+                st.info(f"**Turnout correlation: r = {corr2:.2f}** — "
+                        f"Areas with higher {selected_var.lower()} tend to have "
+                        f"{'higher' if corr2 > 0 else 'lower'} turnout.")
+
+            # Summary table
+            with st.expander("View merged demographics + voting data"):
+                display_cols = ["area", "population", var_col, "overall_d_share",
+                                "precincts", "elections_counted"]
+                if "avg_turnout" in merged.columns:
+                    display_cols.append("avg_turnout")
+                st.dataframe(merged[display_cols], use_container_width=True, hide_index=True)
+
+            st.caption("Note: Correlations are based on 5 geographic areas. "
+                       "With more granular precinct-to-tract mapping, these correlations will sharpen. "
+                       "D Vote Share calculated from D vs R votes in general election federal/state/county races.")
+        elif not merged.empty:
+            st.warning("Not enough matched areas for correlation analysis. Need at least 3 areas with both demographic and election data.")
+        else:
+            st.error("Failed to load or merge demographic and election data.")
+
+    # --- Tract Detail ---
+    elif demo_section == "Tract Detail":
+        st.subheader("Census Tract Detail")
+        st.markdown("*All 11 Boone County census tracts with full demographic data*")
+
+        @st.cache_data(ttl=86400)
+        def load_tract_detail(key):
+            return get_tract_detail(key)
+
+        tracts = load_tract_detail(census_api_key)
+
+        if not tracts.empty:
+            # Summary metrics
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Census Tracts", len(tracts))
+            col2.metric("Total Population", f"{tracts['total_population'].sum():,}")
+            col3.metric("Areas Covered", tracts["area"].nunique())
+
+            # Bar chart: population by tract
+            fig = px.bar(
+                tracts.sort_values("total_population"),
+                x="total_population",
+                y="area_detail",
+                orientation="h",
+                color="area",
+                title="Population by Census Tract",
+                labels={"total_population": "Population", "area_detail": "Tract"},
+            )
+            fig.update_layout(height=450)
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Scatter: income vs education by tract
+            fig2 = px.scatter(
+                tracts,
+                x="median_income",
+                y="pct_bachelors",
+                text="area_detail",
+                size="total_population",
+                color="area",
+                title="Median Income vs. Education Level by Census Tract",
+                labels={"median_income": "Median Household Income",
+                        "pct_bachelors": "% Bachelor's Degree+"},
+            )
+            fig2.update_traces(textposition="top center", textfont_size=8)
+            fig2.update_layout(height=500)
+            st.plotly_chart(fig2, use_container_width=True)
+
+            # Full data table
+            display_tracts = tracts[[
+                "area_detail", "area", "total_population", "median_income",
+                "median_age", "pct_bachelors", "pct_white", "pct_65plus",
+                "pct_owner_occupied", "median_home_value"
+            ]].copy()
+            display_tracts.columns = [
+                "Tract", "Area", "Population", "Median Income",
+                "Median Age", "% Bachelor's+", "% White", "% 65+",
+                "% Owner-Occupied", "Median Home Value"
+            ]
+            st.dataframe(display_tracts, use_container_width=True, hide_index=True)
+
+            st.caption("Source: U.S. Census Bureau, ACS 5-Year Estimates (2022). "
+                       "Tract codes: 8101-8107, with 8106 split into 4 sub-tracts (Zionsville/Whitestown growth area).")
+        else:
+            st.error("Failed to load tract data. Check your API key.")
 
 
 # Footer
