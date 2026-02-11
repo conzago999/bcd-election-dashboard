@@ -1465,6 +1465,185 @@ def get_area_election_summary(db_path=None):
     return area_election
 
 
+def get_2026_target_races(db_path=None):
+    """
+    Build a comprehensive 2026 election target list using historical data.
+
+    Indiana 2026: Primary May 5, General Nov 3.
+    Midterm cycle = same seats as 2022 and 2018.
+
+    Returns a dict with:
+        - 'races': DataFrame of expected 2026 races with historical D performance
+        - 'top_opportunities': DataFrame of highest-potential D targets
+        - 'uncontested_history': DataFrame of races R held uncontested in 2022
+        - 'trend_races': DataFrame of races where D share is trending up
+    """
+    conn = get_connection(db_path)
+
+    # --- 1. Get all races from the last 3 midterm generals (2022, 2018, 2014) ---
+    history = pd.read_sql_query("""
+        WITH race_party_votes AS (
+            SELECT
+                e.election_date,
+                SUBSTR(e.election_date, 1, 4) as year,
+                r.normalized_name,
+                r.race_level,
+                c.party,
+                SUM(res.votes) as party_votes
+            FROM races r
+            JOIN elections e ON r.election_id = e.id
+            JOIN results res ON res.race_id = r.id
+            JOIN candidates c ON res.candidate_id = c.id
+            WHERE e.election_type = 'general'
+              AND e.election_date IN ('2022-11-08', '2018-11-06', '2014-11-04')
+              AND r.race_level IN ('federal', 'state', 'county', 'local')
+            GROUP BY e.election_date, r.normalized_name, c.party
+        ),
+        race_totals AS (
+            SELECT
+                year, election_date, normalized_name, race_level,
+                SUM(party_votes) as total_votes,
+                MAX(CASE WHEN party = 'D' THEN party_votes ELSE 0 END) as d_votes,
+                MAX(CASE WHEN party = 'R' THEN party_votes ELSE 0 END) as r_votes,
+                GROUP_CONCAT(DISTINCT party) as parties
+            FROM race_party_votes
+            GROUP BY election_date, normalized_name
+        )
+        SELECT *,
+            CASE
+                WHEN (d_votes + r_votes) > 0
+                THEN ROUND(CAST(d_votes AS FLOAT) / (d_votes + r_votes) * 100, 1)
+                ELSE NULL
+            END as d_2party_pct
+        FROM race_totals
+        ORDER BY normalized_name, election_date
+    """, conn)
+
+    # --- 2. Build expected 2026 race list from 2022 races ---
+    races_2022 = pd.read_sql_query("""
+        SELECT
+            r.normalized_name, r.race_level,
+            GROUP_CONCAT(DISTINCT c.party) as parties_2022,
+            GROUP_CONCAT(DISTINCT c.name) as candidates_2022,
+            COUNT(DISTINCT res.precinct_id) as precincts_2022
+        FROM races r
+        JOIN elections e ON r.election_id = e.id
+        JOIN results res ON res.race_id = r.id
+        JOIN candidates c ON res.candidate_id = c.id
+        WHERE e.election_date = '2022-11-08'
+          AND r.race_level IN ('federal', 'state', 'county', 'local')
+        GROUP BY r.id
+        ORDER BY r.race_level, r.normalized_name
+    """, conn)
+
+    conn.close()
+
+    if history.empty or races_2022.empty:
+        return {
+            "races": pd.DataFrame(),
+            "top_opportunities": pd.DataFrame(),
+            "uncontested_history": pd.DataFrame(),
+            "trend_races": pd.DataFrame(),
+        }
+
+    # --- 3. For each 2022 race, compute historical D performance ---
+    race_list = []
+    for _, row in races_2022.iterrows():
+        race_name = row["normalized_name"]
+        race_level = row["race_level"]
+
+        # Skip ballot measures, straight party, "No Candidate Filed", etc.
+        skip_names = ["Straight Party", "Public Question"]
+        if any(s.lower() in race_name.lower() for s in skip_names):
+            continue
+
+        # Get historical data for this race
+        race_history = history[history["normalized_name"] == race_name].sort_values("year")
+
+        # Latest D% (most recent cycle with a contested D vs R race)
+        contested = race_history[race_history["d_2party_pct"].notna() & (race_history["d_2party_pct"] > 0)]
+        latest_d_pct = contested["d_2party_pct"].iloc[-1] if len(contested) > 0 else None
+        latest_year = contested["year"].iloc[-1] if len(contested) > 0 else None
+
+        # Number of times D has contested this race
+        d_contested_count = len(contested)
+        total_cycles = len(race_history)
+
+        # Trend: is D share going up?
+        d_trend = None
+        if len(contested) >= 2:
+            d_trend = round(contested["d_2party_pct"].iloc[-1] - contested["d_2party_pct"].iloc[0], 1)
+
+        # Was it uncontested in 2022?
+        was_2022_uncontested = "D" not in (row["parties_2022"] or "")
+
+        # Classify priority
+        if latest_d_pct is not None and latest_d_pct >= 45:
+            priority = "High"
+        elif latest_d_pct is not None and latest_d_pct >= 35:
+            priority = "Medium"
+        elif was_2022_uncontested:
+            priority = "Recruit"
+        else:
+            priority = "Low"
+
+        # Classify action
+        if latest_d_pct is not None and latest_d_pct >= 45:
+            action = "Win — competitive, invest resources"
+        elif was_2022_uncontested and latest_d_pct is None:
+            action = "Recruit — never contested, need candidate"
+        elif was_2022_uncontested and latest_d_pct is not None:
+            action = f"Recruit — D got {latest_d_pct}% in {latest_year}, ran unopposed in 2022"
+        elif d_trend is not None and d_trend > 5:
+            action = f"Trending — D gained {d_trend} pts over cycle"
+        elif latest_d_pct is not None and latest_d_pct >= 35:
+            action = "Build — close enough to invest in"
+        else:
+            action = "Monitor"
+
+        race_list.append({
+            "race": race_name,
+            "level": race_level,
+            "latest_d_pct": latest_d_pct,
+            "latest_d_year": latest_year,
+            "d_contested": f"{d_contested_count}/{total_cycles}",
+            "d_trend": d_trend,
+            "uncontested_2022": was_2022_uncontested,
+            "priority": priority,
+            "action": action,
+            "parties_2022": row["parties_2022"],
+            "candidates_2022": row["candidates_2022"],
+        })
+
+    races_df = pd.DataFrame(race_list)
+
+    # --- 4. Top opportunities: contested + competitive + trending ---
+    top_opps = races_df[
+        (races_df["priority"].isin(["High", "Medium"])) |
+        ((races_df["priority"] == "Recruit") & (races_df["latest_d_pct"].notna()))
+    ].sort_values(
+        "latest_d_pct", ascending=False, na_position="last"
+    ).head(15)
+
+    # --- 5. Uncontested R races (recruitment targets) ---
+    uncontested = races_df[races_df["uncontested_2022"]].sort_values(
+        "latest_d_pct", ascending=False, na_position="last"
+    )
+
+    # --- 6. Trending races (D share increasing) ---
+    trend_races = races_df[
+        (races_df["d_trend"].notna()) & (races_df["d_trend"] > 0)
+    ].sort_values("d_trend", ascending=False)
+
+    return {
+        "races": races_df,
+        "top_opportunities": top_opps,
+        "uncontested_history": uncontested,
+        "trend_races": trend_races,
+        "history": history,
+    }
+
+
 def export_analysis_to_excel(output_path=None, db_path=None):
     """
     Export all key analyses to a single Excel workbook.

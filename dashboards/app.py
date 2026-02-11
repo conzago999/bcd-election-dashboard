@@ -37,6 +37,7 @@ from analysis import (
     get_top_opportunities,
     get_election_overview,
     get_area_election_summary,
+    get_2026_target_races,
 )
 from census_acs import get_area_demographics, get_tract_detail
 from campaign_finance import (
@@ -121,7 +122,7 @@ DEPENDENCY_COLORS = {
 # ============================================================
 # TABS (4 tabs)
 # ============================================================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "The Big Picture",
     "Precinct Intel",
     "Where to Win",
@@ -129,6 +130,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "Data Explorer",
     "Demographics",
     "Campaign Finance",
+    "2026 Prep",
 ])
 
 # ============================================================
@@ -1876,6 +1878,278 @@ with tab7:
                        "D/R classification is estimated from committee names and may undercount both parties.")
     else:
         st.error("Failed to load campaign finance data. Check your internet connection.")
+
+
+# ============================================================
+# TAB 8: 2026 ELECTION PREP
+# ============================================================
+with tab8:
+    st.header("2026 Election Prep")
+    st.markdown("""
+    **Indiana 2026 Midterm: Primary May 5 · General Nov 3**
+
+    This section identifies which Boone County seats are up in 2026 and uses historical data
+    to prioritize where Democratic candidates can compete. Races are classified by historical
+    D performance from the 2014, 2018, and 2022 midterm cycles.
+    """)
+
+    prep_section = st.radio(
+        "Section",
+        ["Target Board", "Recruitment Targets", "Trending Races", "Historical Detail"],
+        horizontal=True,
+        key="prep_section",
+    )
+
+    target_data = get_2026_target_races()
+
+    if target_data["races"].empty:
+        st.warning("Could not load 2026 target data.")
+    else:
+        races = target_data["races"]
+        top_opps = target_data["top_opportunities"]
+        uncontested = target_data["uncontested_history"]
+        trend_races = target_data["trend_races"]
+        history = target_data["history"]
+
+        if prep_section == "Target Board":
+            st.subheader("2026 Target Board")
+            st.markdown("All expected 2026 races, prioritized by D competitiveness.")
+
+            # KPI row
+            kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+            with kpi1:
+                st.metric("Total Races", len(races))
+            with kpi2:
+                high_count = len(races[races["priority"] == "High"])
+                st.metric("High Priority", high_count)
+            with kpi3:
+                recruit_count = len(races[races["priority"] == "Recruit"])
+                st.metric("Need Candidate", recruit_count)
+            with kpi4:
+                trending = len(trend_races)
+                st.metric("Trending D", trending)
+
+            # Priority filter
+            priority_filter = st.multiselect(
+                "Filter by priority",
+                ["High", "Medium", "Recruit", "Low"],
+                default=["High", "Medium", "Recruit"],
+                key="prep_priority_filter",
+            )
+
+            level_filter = st.multiselect(
+                "Filter by level",
+                sorted(races["level"].unique()),
+                default=sorted(races["level"].unique()),
+                key="prep_level_filter",
+            )
+
+            filtered = races[
+                (races["priority"].isin(priority_filter)) &
+                (races["level"].isin(level_filter))
+            ].copy()
+
+            # Display columns
+            display_cols = ["race", "level", "priority", "latest_d_pct", "d_trend", "d_contested", "action"]
+            display_df = filtered[display_cols].copy()
+            display_df = display_df.rename(columns={
+                "race": "Race",
+                "level": "Level",
+                "priority": "Priority",
+                "latest_d_pct": "Last D%",
+                "d_trend": "D Trend",
+                "d_contested": "D Contested",
+                "action": "Recommended Action",
+            })
+
+            st.dataframe(
+                display_df.sort_values(["Priority", "Last D%"], ascending=[True, False]),
+                use_container_width=True,
+                hide_index=True,
+                height=600,
+            )
+
+            # Top opportunities chart
+            chart_data = top_opps[top_opps["latest_d_pct"].notna()].copy()
+            if not chart_data.empty:
+                st.subheader("Top D Opportunities (by Last D Vote Share)")
+                fig = px.bar(
+                    chart_data.sort_values("latest_d_pct"),
+                    x="latest_d_pct",
+                    y="race",
+                    orientation="h",
+                    color="latest_d_pct",
+                    color_continuous_scale=["#e74c3c", "#f39c12", "#2ecc71"],
+                    range_color=[25, 55],
+                    title="",
+                    labels={"latest_d_pct": "D Two-Party %", "race": ""},
+                )
+                fig.add_vline(x=50, line_dash="dash", line_color="gray",
+                              annotation_text="50% (Win)", annotation_position="top")
+                fig.update_layout(height=max(400, len(chart_data) * 35), showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+
+        elif prep_section == "Recruitment Targets":
+            st.subheader("Candidate Recruitment Targets")
+            st.markdown("""
+            These races had **no Democratic candidate in 2022**. Fielding a candidate — even in
+            a tough race — builds name recognition, develops the bench, and forces R to spend resources.
+            Races with historical D performance are higher-priority recruitment targets.
+            """)
+
+            if uncontested.empty:
+                st.info("All 2022 races were contested by D candidates!")
+            else:
+                # Split into tiers
+                has_history = uncontested[uncontested["latest_d_pct"].notna()]
+                no_history = uncontested[uncontested["latest_d_pct"].isna()]
+
+                if not has_history.empty:
+                    st.markdown("#### Previously Contested — Need Candidate Again")
+                    st.markdown("These races had a D candidate in a prior cycle but went uncontested in 2022.")
+                    display_cols = ["race", "level", "latest_d_pct", "latest_d_year", "d_contested", "action"]
+                    display_df = has_history[display_cols].rename(columns={
+                        "race": "Race", "level": "Level", "latest_d_pct": "Last D%",
+                        "latest_d_year": "Last D Year", "d_contested": "D Contested",
+                        "action": "Recommended Action",
+                    })
+                    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+                if not no_history.empty:
+                    st.markdown("#### Never Contested — New Territory")
+                    st.markdown("These races have never had a D challenger in our data (2014-2022). "
+                                "Township boards and trustees are often good entry-level races for new candidates.")
+                    display_cols = ["race", "level", "action"]
+                    display_df = no_history[display_cols].rename(columns={
+                        "race": "Race", "level": "Level", "action": "Recommended Action",
+                    })
+                    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+                # Summary stats
+                st.markdown("---")
+                col1, col2 = st.columns(2)
+                with col1:
+                    by_level = uncontested.groupby("level").size().reset_index(name="count")
+                    fig = px.pie(
+                        by_level,
+                        names="level",
+                        values="count",
+                        title="Uncontested R Races by Level",
+                        color_discrete_sequence=px.colors.qualitative.Set2,
+                    )
+                    fig.update_layout(height=350)
+                    st.plotly_chart(fig, use_container_width=True)
+                with col2:
+                    st.markdown("#### Recruitment Priority")
+                    st.markdown(f"- **{len(has_history)}** races with prior D performance — re-recruit")
+                    st.markdown(f"- **{len(no_history)}** races never contested — build from scratch")
+                    st.markdown(f"- **{len(uncontested)}** total recruitment targets")
+                    st.markdown("")
+                    st.markdown("**Tip:** Township trustee and board races are low-cost, high-value "
+                                "recruitment targets. They require minimal fundraising and build the "
+                                "local candidate pipeline.")
+
+        elif prep_section == "Trending Races":
+            st.subheader("Races Trending Democratic")
+            st.markdown("These races show D vote share **increasing** across midterm cycles (2014→2018→2022).")
+
+            if trend_races.empty:
+                st.info("No races with measurable D trend across multiple cycles.")
+            else:
+                display_cols = ["race", "level", "latest_d_pct", "d_trend", "d_contested", "priority"]
+                display_df = trend_races[display_cols].rename(columns={
+                    "race": "Race", "level": "Level", "latest_d_pct": "Last D%",
+                    "d_trend": "D Trend (pts)", "d_contested": "D Contested", "priority": "Priority",
+                })
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+                # Trend chart: show D% across cycles for trending races
+                trending_names = trend_races["race"].head(10).tolist()
+                trend_history = history[
+                    (history["normalized_name"].isin(trending_names)) &
+                    (history["d_2party_pct"].notna()) &
+                    (history["d_2party_pct"] > 0)
+                ].copy()
+
+                if not trend_history.empty:
+                    fig = px.line(
+                        trend_history,
+                        x="year",
+                        y="d_2party_pct",
+                        color="normalized_name",
+                        markers=True,
+                        title="D Vote Share Trend Across Midterm Cycles",
+                        labels={"d_2party_pct": "D Two-Party %", "year": "Election Year",
+                                "normalized_name": "Race"},
+                    )
+                    fig.add_hline(y=50, line_dash="dash", line_color="gray")
+                    fig.update_layout(height=500)
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    st.caption("Only races with D candidates in 2+ midterm cycles are shown. "
+                               "Trend = change from first to last contested midterm cycle.")
+
+        elif prep_section == "Historical Detail":
+            st.subheader("Full Historical Race Data")
+            st.markdown("Browse D performance for every race across midterm generals (2014, 2018, 2022).")
+
+            # Pivot: race × year → D%
+            contested_history = history[
+                (history["d_2party_pct"].notna()) &
+                (history["d_2party_pct"] > 0)
+            ].copy()
+
+            if contested_history.empty:
+                st.info("No contested D vs R race data available.")
+            else:
+                pivot = contested_history.pivot_table(
+                    index=["normalized_name", "race_level"],
+                    columns="year",
+                    values="d_2party_pct",
+                ).reset_index()
+                pivot.columns.name = None
+                pivot = pivot.rename(columns={
+                    "normalized_name": "Race",
+                    "race_level": "Level",
+                })
+
+                # Add trend column if 2022 and at least one prior year exist
+                year_cols = [c for c in pivot.columns if c in ["2014", "2018", "2022"]]
+                if len(year_cols) >= 2:
+                    def calc_trend(row):
+                        vals = [row[y] for y in year_cols if pd.notna(row[y])]
+                        if len(vals) >= 2:
+                            return round(vals[-1] - vals[0], 1)
+                        return None
+                    pivot["Trend"] = pivot.apply(calc_trend, axis=1)
+
+                pivot = pivot.sort_values("Level")
+                st.dataframe(pivot, use_container_width=True, hide_index=True, height=600)
+
+                # All races by level
+                st.markdown("---")
+                st.subheader("All 2022 Races by Level")
+                st.markdown("Complete list of races from 2022 (which will cycle again in 2026).")
+
+                level_counts = races.groupby("level").size().reset_index(name="count")
+                fig = px.bar(
+                    level_counts.sort_values("count", ascending=False),
+                    x="level",
+                    y="count",
+                    color="level",
+                    title="2026 Expected Races by Level",
+                    labels={"level": "Race Level", "count": "Number of Races"},
+                    color_discrete_sequence=px.colors.qualitative.Set2,
+                )
+                fig.update_layout(height=350, showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+
+                with st.expander("View all 2022 races (2026 preview)"):
+                    all_display = races[["race", "level", "parties_2022", "candidates_2022"]].rename(columns={
+                        "race": "Race", "level": "Level", "parties_2022": "Parties (2022)",
+                        "candidates_2022": "Candidates (2022)",
+                    })
+                    st.dataframe(all_display, use_container_width=True, hide_index=True, height=500)
 
 
 # Footer
