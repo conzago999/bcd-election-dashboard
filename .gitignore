@@ -14,3 +14,5 @@ exports/
 *.pdf
 generate_docx.py
 RESEARCH_REPORT.md
+data/synthetic_voter_file.csv
+data/*_voter_file*.csv
