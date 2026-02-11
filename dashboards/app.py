@@ -39,6 +39,11 @@ from analysis import (
     get_area_election_summary,
 )
 from census_acs import get_area_demographics, get_tract_detail
+from campaign_finance import (
+    get_boone_county_contributions,
+    get_contribution_summary,
+    get_top_committees,
+)
 
 st.set_page_config(
     page_title="BCD Election Data",
@@ -116,13 +121,14 @@ DEPENDENCY_COLORS = {
 # ============================================================
 # TABS (4 tabs)
 # ============================================================
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "The Big Picture",
     "Precinct Intel",
     "Where to Win",
     "Voting Patterns",
     "Data Explorer",
     "Demographics",
+    "Campaign Finance",
 ])
 
 # ============================================================
@@ -1602,6 +1608,274 @@ with tab6:
                        "Tract codes: 8101-8107, with 8106 split into 4 sub-tracts (Zionsville/Whitestown growth area).")
         else:
             st.error("Failed to load tract data. Check your API key.")
+
+
+# ============================================================
+# TAB 7: CAMPAIGN FINANCE
+# ============================================================
+with tab7:
+    st.header("Campaign Finance")
+    st.markdown("*Indiana state campaign contributions from Boone County donors (2018-2024)*")
+
+    @st.cache_data(ttl=86400, show_spinner="Downloading campaign finance data...")
+    def load_campaign_finance():
+        return get_boone_county_contributions()
+
+    finance_data = load_campaign_finance()
+
+    if not finance_data.empty:
+        finance_section = st.radio(
+            "Section",
+            ["Overview", "Party Breakdown", "Top Recipients", "Donor Geography"],
+            horizontal=True,
+            key="finance_section"
+        )
+
+        # --- Overview ---
+        if finance_section == "Overview":
+            st.subheader("Boone County Donor Overview")
+
+            # KPI cards
+            total_amount = finance_data["Amount"].sum()
+            total_contributions = len(finance_data)
+            unique_donors = finance_data["Name"].nunique()
+            years_covered = sorted(finance_data["year"].unique())
+
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Total Contributions", f"${total_amount:,.0f}")
+            col2.metric("Donation Count", f"{total_contributions:,}")
+            col3.metric("Unique Donors", f"{unique_donors:,}")
+            col4.metric("Years Covered", f"{len(years_covered)}")
+
+            st.divider()
+
+            # Trend over time
+            yearly = finance_data.groupby("year").agg(
+                total=("Amount", "sum"),
+                count=("Amount", "count"),
+                donors=("Name", "nunique"),
+                avg=("Amount", "mean"),
+            ).reset_index()
+
+            col_left, col_right = st.columns(2)
+
+            with col_left:
+                fig = px.bar(
+                    yearly,
+                    x="year",
+                    y="total",
+                    color="total",
+                    color_continuous_scale=["#3498db", "#2ecc71"],
+                    title="Total Contributions by Year",
+                    labels={"year": "Year", "total": "Total ($)"},
+                    text=yearly["total"].apply(lambda x: f"${x:,.0f}"),
+                )
+                fig.update_traces(textposition="outside")
+                fig.update_layout(height=400, showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+
+            with col_right:
+                fig2 = px.bar(
+                    yearly,
+                    x="year",
+                    y="donors",
+                    color="donors",
+                    color_continuous_scale=["#e74c3c", "#f39c12"],
+                    title="Unique Donors by Year",
+                    labels={"year": "Year", "donors": "Unique Donors"},
+                    text="donors",
+                )
+                fig2.update_traces(textposition="outside")
+                fig2.update_layout(height=400, showlegend=False)
+                st.plotly_chart(fig2, use_container_width=True)
+
+            # Average contribution trend
+            fig3 = px.line(
+                yearly,
+                x="year",
+                y="avg",
+                markers=True,
+                title="Average Contribution Size Over Time",
+                labels={"year": "Year", "avg": "Avg Contribution ($)"},
+            )
+            fig3.update_layout(height=350)
+            st.plotly_chart(fig3, use_container_width=True)
+
+            st.caption("Source: Indiana Election Division bulk contribution data. "
+                       "Filtered to core Boone County ZIP codes (46035, 46050, 46052, 46069, 46071, 46075, 46077).")
+
+        # --- Party Breakdown ---
+        elif finance_section == "Party Breakdown":
+            st.subheader("Estimated Party Breakdown")
+            st.markdown("*Contributions classified as D/R based on committee name keywords. "
+                        "'Unknown' includes PACs, local races, and committees without clear party affiliation.*")
+
+            summary = get_contribution_summary(finance_data)
+
+            if not summary.empty:
+                # Stacked bar: D vs R vs Unknown by year
+                party_colors = {"D": "#3498db", "R": "#e74c3c", "Unknown": "#95a5a6"}
+
+                fig = px.bar(
+                    summary,
+                    x="year",
+                    y="total_amount",
+                    color="party_est",
+                    barmode="stack",
+                    color_discrete_map=party_colors,
+                    title="Total Contributions by Party & Year",
+                    labels={"year": "Year", "total_amount": "Total ($)", "party_est": "Party"},
+                )
+                fig.update_layout(height=450)
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Donor count comparison
+                fig2 = px.bar(
+                    summary,
+                    x="year",
+                    y="unique_donors",
+                    color="party_est",
+                    barmode="group",
+                    color_discrete_map=party_colors,
+                    title="Unique Donors by Party & Year",
+                    labels={"year": "Year", "unique_donors": "Unique Donors", "party_est": "Party"},
+                )
+                fig2.update_layout(height=400)
+                st.plotly_chart(fig2, use_container_width=True)
+
+                # D vs R comparison metrics
+                st.divider()
+                st.subheader("D vs R Summary (All Years Combined)")
+                d_total = summary[summary["party_est"] == "D"]["total_amount"].sum()
+                r_total = summary[summary["party_est"] == "R"]["total_amount"].sum()
+                d_donors = summary[summary["party_est"] == "D"]["unique_donors"].sum()
+                r_donors = summary[summary["party_est"] == "R"]["unique_donors"].sum()
+
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("D Total", f"${d_total:,.0f}")
+                col2.metric("R Total", f"${r_total:,.0f}")
+                col3.metric("D Donors", f"{d_donors:,}")
+                col4.metric("R Donors", f"{r_donors:,}")
+
+                if d_donors > 0 and r_donors > 0:
+                    d_avg = d_total / d_donors
+                    r_avg = r_total / r_donors
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("D Avg/Donor", f"${d_avg:,.0f}")
+                    col2.metric("R Avg/Donor", f"${r_avg:,.0f}")
+                    col3.metric("R:D Ratio", f"{r_total/d_total:.1f}x")
+
+                    st.info(f"**Key insight:** Republican donors in Boone County give "
+                            f"${r_avg:,.0f} per donor on average vs ${d_avg:,.0f} for Democrats — "
+                            f"a {r_avg/d_avg:.1f}x difference. But Democrats have {d_donors:,} unique donors "
+                            f"vs {r_donors:,} for Republicans — a broader base.")
+
+                with st.expander("View party summary data"):
+                    st.dataframe(summary, use_container_width=True, hide_index=True)
+
+        # --- Top Recipients ---
+        elif finance_section == "Top Recipients":
+            st.subheader("Top Recipient Committees")
+            st.markdown("*Where Boone County donors send their money*")
+
+            top_n = st.slider("Number of committees to show", 10, 30, 15, key="finance_top_n")
+            top = get_top_committees(finance_data, top_n=top_n)
+
+            if not top.empty:
+                party_colors = {"D": "#3498db", "R": "#e74c3c", "Unknown": "#95a5a6"}
+
+                fig = px.bar(
+                    top.sort_values("total_amount"),
+                    x="total_amount",
+                    y="Committee",
+                    orientation="h",
+                    color="party_est",
+                    color_discrete_map=party_colors,
+                    title=f"Top {top_n} Recipient Committees (All Years)",
+                    labels={"total_amount": "Total ($)", "Committee": "", "party_est": "Party"},
+                    hover_data=["unique_donors", "contribution_count", "years_active"],
+                )
+                fig.update_layout(height=max(500, top_n * 28))
+                st.plotly_chart(fig, use_container_width=True)
+
+                with st.expander("View committee data"):
+                    display_top = top.copy()
+                    display_top["total_amount"] = display_top["total_amount"].apply(lambda x: f"${x:,.0f}")
+                    st.dataframe(display_top, use_container_width=True, hide_index=True)
+
+        # --- Donor Geography ---
+        elif finance_section == "Donor Geography":
+            st.subheader("Donor Geography")
+            st.markdown("*Where in Boone County are political donors?*")
+
+            by_zip = finance_data.groupby(["zip_clean", "area", "year"]).agg(
+                total=("Amount", "sum"),
+                count=("Amount", "count"),
+                donors=("Name", "nunique"),
+            ).reset_index()
+
+            # Aggregate by area across all years
+            by_area_all = finance_data.groupby("area").agg(
+                total=("Amount", "sum"),
+                count=("Amount", "count"),
+                donors=("Name", "nunique"),
+                d_amount=("Amount", lambda x: x[finance_data.loc[x.index, "party_est"] == "D"].sum()),
+                r_amount=("Amount", lambda x: x[finance_data.loc[x.index, "party_est"] == "R"].sum()),
+            ).reset_index()
+            by_area_all["d_pct"] = (by_area_all["d_amount"] / by_area_all["total"] * 100).round(1)
+            by_area_all["avg_donation"] = (by_area_all["total"] / by_area_all["count"]).round(0)
+
+            col_left, col_right = st.columns(2)
+
+            with col_left:
+                fig = px.bar(
+                    by_area_all.sort_values("total"),
+                    x="total",
+                    y="area",
+                    orientation="h",
+                    color="total",
+                    color_continuous_scale=["#f39c12", "#2ecc71"],
+                    title="Total Contributions by Area",
+                    labels={"total": "Total ($)", "area": ""},
+                )
+                fig.update_layout(height=350, showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+
+            with col_right:
+                fig2 = px.bar(
+                    by_area_all.sort_values("donors"),
+                    x="donors",
+                    y="area",
+                    orientation="h",
+                    color="donors",
+                    color_continuous_scale=["#e74c3c", "#3498db"],
+                    title="Unique Donors by Area",
+                    labels={"donors": "Unique Donors", "area": ""},
+                )
+                fig2.update_layout(height=350, showlegend=False)
+                st.plotly_chart(fig2, use_container_width=True)
+
+            # D share of donations by area
+            fig3 = px.bar(
+                by_area_all.sort_values("d_pct"),
+                x="d_pct",
+                y="area",
+                orientation="h",
+                color="d_pct",
+                color_continuous_scale=["#e74c3c", "#3498db"],
+                title="Democratic Share of Identifiable Donations by Area",
+                labels={"d_pct": "D Share %", "area": ""},
+            )
+            fig3.update_layout(height=350, showlegend=False)
+            st.plotly_chart(fig3, use_container_width=True)
+
+            with st.expander("View geographic data"):
+                st.dataframe(by_area_all, use_container_width=True, hide_index=True)
+
+            st.caption("Areas match the Census demographic areas. "
+                       "D/R classification is estimated from committee names and may undercount both parties.")
+    else:
+        st.error("Failed to load campaign finance data. Check your internet connection.")
 
 
 # Footer
