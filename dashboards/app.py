@@ -1016,24 +1016,22 @@ with tab5:
                 "Precincts", "Turnout Precincts", "Confidence", "Score"
             ]
 
-            # Color-code confidence
-            def highlight_confidence(row):
-                level = row["Confidence"].lower() if isinstance(row["Confidence"], str) else ""
-                if level == "high":
-                    return ["background-color: #d4edda"] * len(row)
-                elif level == "medium":
-                    return ["background-color: #fff3cd"] * len(row)
-                elif level == "low":
-                    return ["background-color: #f8d7da"] * len(row)
-                return [""] * len(row)
+            # Use emoji indicators for confidence (dark-mode friendly)
+            confidence_icons = {"high": "HIGH", "medium": "MEDIUM", "low": "LOW"}
+            display_df["Confidence"] = display_df["Confidence"].apply(
+                lambda x: confidence_icons.get(x.lower(), x) if isinstance(x, str) else x
+            )
+            display_df["Score"] = display_df["Score"].apply(lambda x: f"{x:.0%}")
 
             st.dataframe(
-                display_df.style.apply(highlight_confidence, axis=1).format(
-                    {"Score": "{:.0%}"}
-                ),
+                display_df,
                 use_container_width=True,
                 hide_index=True,
                 height=min(800, 35 * len(display_df) + 38),
+                column_config={
+                    "Score": st.column_config.TextColumn("Score"),
+                    "Confidence": st.column_config.TextColumn("Confidence"),
+                },
             )
 
             # Drill-down: select an election to see its races
@@ -1081,33 +1079,28 @@ with tab5:
                     col2.metric("With Normalized Names", int(changed_count))
                     col3.metric("Race Levels", races_df["race_level"].nunique())
 
-                    # Highlight changed names
-                    def highlight_name_change(row):
-                        if row["name_changed"]:
-                            return ["background-color: #fff3cd"] * len(row)
-                        return [""] * len(row)
-
                     display_races = races_df[[
                         "race_name", "normalized_name", "race_level",
-                        "race_type", "total_votes", "candidates", "precincts"
+                        "race_type", "total_votes", "candidates", "precincts", "name_changed"
                     ]].copy()
+                    # Add a visual indicator column for changed names
+                    display_races["Changed"] = display_races["name_changed"].apply(
+                        lambda x: "Yes" if x else ""
+                    )
+                    display_races = display_races.drop(columns=["name_changed"])
                     display_races.columns = [
                         "Original Name", "Normalized Name", "Level",
-                        "Type", "Total Votes", "Candidates", "Precincts"
+                        "Type", "Total Votes", "Candidates", "Precincts", "Changed"
                     ]
 
                     st.dataframe(
-                        display_races.style.apply(
-                            lambda row: ["background-color: #fff3cd"] * len(row)
-                            if races_df.iloc[row.name]["name_changed"] else [""] * len(row),
-                            axis=1
-                        ),
+                        display_races,
                         use_container_width=True,
                         hide_index=True,
                     )
 
                     if changed_count > 0:
-                        st.caption("Highlighted rows have normalized names that differ from the original PDF data.")
+                        st.caption("Rows marked 'Yes' in Changed column have normalized names that differ from the original PDF data.")
                 else:
                     st.info("No races found for this election.")
         else:
@@ -1279,23 +1272,17 @@ with tab5:
         """, conn)
 
         if not dq_df.empty:
-            def highlight_quality(row):
-                level = row["Confidence"].lower() if isinstance(row["Confidence"], str) else ""
-                if level == "high":
-                    return ["background-color: #d4edda"] * len(row)
-                elif level == "medium":
-                    return ["background-color: #fff3cd"] * len(row)
-                elif level == "low":
-                    return ["background-color: #f8d7da"] * len(row)
-                return [""] * len(row)
+            dq_df["Score"] = dq_df["Score"].apply(lambda x: f"{x:.0%}" if isinstance(x, (int, float)) else x)
 
             st.dataframe(
-                dq_df.style.apply(highlight_quality, axis=1).format(
-                    {"Score": "{:.0%}"}
-                ),
+                dq_df,
                 use_container_width=True,
                 hide_index=True,
                 height=min(800, 35 * len(dq_df) + 38),
+                column_config={
+                    "Score": st.column_config.TextColumn("Score"),
+                    "Confidence": st.column_config.TextColumn("Confidence"),
+                },
             )
         else:
             st.info("No data quality assessments found.")
