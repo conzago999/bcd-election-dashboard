@@ -45,6 +45,14 @@ from campaign_finance import (
     get_contribution_summary,
     get_top_committees,
 )
+from voter_analysis import (
+    load_voter_file,
+    get_voter_universe_summary,
+    get_turnout_scored_voters,
+    get_persuasion_targets,
+    get_precinct_voter_profile,
+    get_area_voter_summary,
+)
 
 st.set_page_config(
     page_title="BCD Election Data",
@@ -122,7 +130,7 @@ DEPENDENCY_COLORS = {
 # ============================================================
 # TABS (4 tabs)
 # ============================================================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "The Big Picture",
     "Precinct Intel",
     "Where to Win",
@@ -131,6 +139,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "Demographics",
     "Campaign Finance",
     "2026 Prep",
+    "Voter File",
 ])
 
 # ============================================================
@@ -2150,6 +2159,497 @@ with tab8:
                         "candidates_2022": "Candidates (2022)",
                     })
                     st.dataframe(all_display, use_container_width=True, hide_index=True, height=500)
+
+
+# ============================================================
+# TAB 9: VOTER FILE ANALYSIS
+# ============================================================
+with tab9:
+    st.header("Voter File Analysis")
+
+    # Try to load voter file
+    voter_file_path = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "data", "synthetic_voter_file.csv"
+    )
+
+    # Also check for a real uploaded file
+    if not os.path.exists(voter_file_path):
+        st.info("No voter file found. Upload a VAN export CSV or generate synthetic data.")
+        uploaded_file = st.file_uploader(
+            "Upload VAN Export CSV",
+            type=["csv"],
+            key="voter_file_upload",
+        )
+        if uploaded_file is not None:
+            import tempfile
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+            tmp.write(uploaded_file.read())
+            tmp.close()
+            voter_file_path = tmp.name
+        else:
+            st.markdown("""
+            **To generate synthetic data locally:**
+            ```bash
+            python src/generate_synthetic_voters.py
+            ```
+            This creates 62,000 realistic fake voter records for development.
+            """)
+            st.stop()
+
+    @st.cache_data(ttl=3600)
+    def _load_voter_data(path):
+        return load_voter_file(path)
+
+    vf = _load_voter_data(voter_file_path)
+
+    if vf.empty:
+        st.error("Could not load voter file.")
+    else:
+        is_synthetic = "synthetic" in voter_file_path.lower()
+        if is_synthetic:
+            st.caption("Using synthetic voter data for development. "
+                       "Replace with real VAN export for actual analysis.")
+
+        vf_section = st.radio(
+            "Section",
+            ["Voter Universe", "Turnout Scoring", "Persuasion Targets", "Precinct Drill-Down"],
+            horizontal=True,
+            key="vf_section",
+        )
+
+        if vf_section == "Voter Universe":
+            st.subheader("Voter Universe Overview")
+
+            summary = get_voter_universe_summary(vf)
+
+            # KPI row
+            k1, k2, k3, k4 = st.columns(4)
+            with k1:
+                st.metric("Total Registered", f"{summary['total']:,}")
+            with k2:
+                st.metric("Active Voters", f"{summary['active']:,}")
+            with k3:
+                d_count = summary["party"].get("D", 0)
+                r_count = summary["party"].get("R", 0)
+                unaffiliated = summary["party"].get("", 0)
+                st.metric("D Primary Pullers", f"{d_count:,}")
+            with k4:
+                st.metric("Avg Turnout Score", f"{summary['avg_general_score']}/4")
+
+            # Party breakdown
+            col1, col2 = st.columns(2)
+            with col1:
+                party_data = pd.DataFrame([
+                    {"Party": "Republican", "Count": r_count},
+                    {"Party": "Democratic", "Count": d_count},
+                    {"Party": "Unaffiliated", "Count": unaffiliated},
+                ])
+                fig_party = px.pie(
+                    party_data,
+                    names="Party",
+                    values="Count",
+                    title="Voter Registration by Primary Pull",
+                    color="Party",
+                    color_discrete_map={
+                        "Republican": "#e74c3c",
+                        "Democratic": "#3498db",
+                        "Unaffiliated": "#95a5a6",
+                    },
+                )
+                fig_party.update_layout(height=350)
+                st.plotly_chart(fig_party, use_container_width=True)
+
+            with col2:
+                vt_data = pd.DataFrame([
+                    {"Type": t, "Count": summary["voter_type"].get(t, 0)}
+                    for t in ["Super Voter", "Regular", "Occasional", "Inactive"]
+                ])
+                fig_vt = px.pie(
+                    vt_data,
+                    names="Type",
+                    values="Count",
+                    title="Voter Engagement Types",
+                    color="Type",
+                    color_discrete_map={
+                        "Super Voter": "#27ae60",
+                        "Regular": "#2ecc71",
+                        "Occasional": "#f39c12",
+                        "Inactive": "#e74c3c",
+                    },
+                )
+                fig_vt.update_layout(height=350)
+                st.plotly_chart(fig_vt, use_container_width=True)
+
+            # Area summary table
+            st.subheader("Voter Summary by Area")
+            area_summary = get_area_voter_summary(vf)
+            if not area_summary.empty:
+                st.dataframe(area_summary, use_container_width=True, hide_index=True)
+
+            # Age distribution
+            col3, col4 = st.columns(2)
+            with col3:
+                age_data = pd.DataFrame([
+                    {"Age Group": ag, "Count": summary["age_group"].get(ag, 0)}
+                    for ag in ["18-29", "30-44", "45-64", "65+"]
+                ])
+                fig_age = px.bar(
+                    age_data,
+                    x="Age Group",
+                    y="Count",
+                    title="Voter Age Distribution",
+                    color="Age Group",
+                    color_discrete_sequence=px.colors.qualitative.Set2,
+                )
+                fig_age.update_layout(height=350, showlegend=False)
+                st.plotly_chart(fig_age, use_container_width=True)
+
+            with col4:
+                gender_data = pd.DataFrame([
+                    {"Gender": g, "Count": summary["gender"].get(g, 0)}
+                    for g in ["F", "M"]
+                ])
+                fig_gender = px.pie(
+                    gender_data,
+                    names="Gender",
+                    values="Count",
+                    title="Voter Gender Distribution",
+                    color="Gender",
+                    color_discrete_map={"F": "#9b59b6", "M": "#3498db"},
+                )
+                fig_gender.update_layout(height=350)
+                st.plotly_chart(fig_gender, use_container_width=True)
+
+        elif vf_section == "Turnout Scoring":
+            st.subheader("Voter Turnout Analysis")
+            st.markdown("""
+            Voters scored by how many of the last 4 general elections they voted in (0-4).
+            **Super Voters** (4/4) are the reliable base. **Surge voters** (voted 2020 but
+            not 2022) are the #1 mobilization target for 2026.
+            """)
+
+            scored = get_turnout_scored_voters(vf)
+
+            # KPI row
+            k1, k2, k3, k4 = st.columns(4)
+            with k1:
+                st.metric(
+                    "Super Voters (4/4)",
+                    f"{len(scored[scored['voter_type'] == 'Super Voter']):,}",
+                )
+            with k2:
+                surge_count = int(scored["surge_2020"].sum())
+                st.metric("Surge 2020 Voters", f"{surge_count:,}")
+            with k3:
+                dropoff_count = int(scored["dropoff"].sum())
+                st.metric("Drop-Off Voters", f"{dropoff_count:,}")
+            with k4:
+                activator_count = int(scored["new_activator"].sum())
+                st.metric("New Activators", f"{activator_count:,}")
+
+            # Propensity distribution by area
+            col1, col2 = st.columns(2)
+            with col1:
+                prop_area = scored.groupby(["Area", "propensity"]).size().reset_index(name="count")
+                fig_prop = px.bar(
+                    prop_area,
+                    x="Area",
+                    y="count",
+                    color="propensity",
+                    title="Voter Propensity by Area",
+                    barmode="stack",
+                    color_discrete_map={
+                        "High": "#27ae60", "Medium": "#f39c12",
+                        "Low": "#e67e22", "None": "#e74c3c",
+                    },
+                    category_orders={"propensity": ["High", "Medium", "Low", "None"]},
+                )
+                fig_prop.update_layout(height=400)
+                st.plotly_chart(fig_prop, use_container_width=True)
+
+            with col2:
+                gs_dist = scored["general_score"].value_counts().sort_index().reset_index()
+                gs_dist.columns = ["Elections Voted (of 4)", "Voters"]
+                fig_gs = px.bar(
+                    gs_dist,
+                    x="Elections Voted (of 4)",
+                    y="Voters",
+                    title="General Election Participation Distribution",
+                    color="Elections Voted (of 4)",
+                    color_continuous_scale=["#e74c3c", "#f39c12", "#27ae60"],
+                )
+                fig_gs.update_layout(height=400, showlegend=False)
+                st.plotly_chart(fig_gs, use_container_width=True)
+
+            # Surge voters breakdown
+            st.subheader("Surge 2020 Voters (Mobilization Targets)")
+            st.markdown("""
+            These voters showed up for the 2020 presidential election but **skipped
+            the 2022 midterm**. They're proven voters who can be re-activated with
+            the right outreach. This is your #1 GOTV target list for 2026.
+            """)
+            surge = scored[scored["surge_2020"]].copy()
+            surge_by_area = surge.groupby("Area").agg(
+                count=("VANID", "count"),
+                d_primary=("Party", lambda x: (x == "D").sum()),
+                unaffiliated=("Party", lambda x: (x == "").sum()),
+                avg_age=("Age", "mean"),
+            ).reset_index()
+            surge_by_area["avg_age"] = surge_by_area["avg_age"].round(1)
+            surge_by_area = surge_by_area.sort_values("count", ascending=False)
+            surge_by_area.columns = ["Area", "Surge Voters", "D Primary", "Unaffiliated", "Avg Age"]
+            st.dataframe(surge_by_area, use_container_width=True, hide_index=True)
+
+            # Election-by-election participation
+            st.subheader("Election-by-Election Participation")
+            election_rates = []
+            for ename in ["General2024", "General2022", "General2020", "General2018",
+                          "Primary2024", "Primary2022", "Primary2020", "Primary2018"]:
+                voted = (scored[ename] == "Y").sum()
+                rate = voted / len(scored) * 100
+                etype = "General" if "General" in ename else "Primary"
+                election_rates.append({
+                    "Election": ename, "Type": etype,
+                    "Voted": voted, "Rate %": round(rate, 1),
+                })
+            er_df = pd.DataFrame(election_rates)
+            fig_er = px.bar(
+                er_df,
+                x="Election",
+                y="Rate %",
+                color="Type",
+                title="Participation Rate by Election",
+                color_discrete_map={"General": "#3498db", "Primary": "#e67e22"},
+            )
+            fig_er.update_layout(height=400)
+            st.plotly_chart(fig_er, use_container_width=True)
+
+        elif vf_section == "Persuasion Targets":
+            st.subheader("Persuasion Target Universe")
+            st.markdown("""
+            Voters who are **unaffiliated or D-leaning**, **actively voting**, and live
+            in **competitive areas**. These are the people worth knocking doors for.
+            Sorted by priority score (higher = more valuable to contact).
+            """)
+
+            targets = get_persuasion_targets(vf)
+
+            if targets.empty:
+                st.info("No persuasion targets identified.")
+            else:
+                # KPI row
+                k1, k2, k3, k4 = st.columns(4)
+                with k1:
+                    st.metric("Total Targets", f"{len(targets):,}")
+                with k2:
+                    high_priority = len(targets[targets["priority_score"] >= 8])
+                    st.metric("High Priority (8+)", f"{high_priority:,}")
+                with k3:
+                    in_zville = len(targets[targets["Area"] == "Zionsville/Whitestown"])
+                    st.metric("In Zionsville Area", f"{in_zville:,}")
+                with k4:
+                    has_phone = targets["Phone"].notna().sum()
+                    st.metric("Have Phone #", f"{int(has_phone):,}")
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    target_area = targets["Area"].value_counts().reset_index()
+                    target_area.columns = ["Area", "Targets"]
+                    fig_ta = px.bar(
+                        target_area.sort_values("Targets"),
+                        x="Targets",
+                        y="Area",
+                        orientation="h",
+                        title="Persuasion Targets by Area",
+                        color="Targets",
+                        color_continuous_scale=["#f39c12", "#27ae60"],
+                    )
+                    fig_ta.update_layout(height=350, showlegend=False)
+                    st.plotly_chart(fig_ta, use_container_width=True)
+
+                with col2:
+                    score_dist = targets["priority_score"].value_counts().sort_index().reset_index()
+                    score_dist.columns = ["Priority Score", "Count"]
+                    fig_sd = px.bar(
+                        score_dist,
+                        x="Priority Score",
+                        y="Count",
+                        title="Target Priority Score Distribution",
+                        color="Priority Score",
+                        color_continuous_scale=["#e74c3c", "#f39c12", "#27ae60"],
+                    )
+                    fig_sd.update_layout(height=350, showlegend=False)
+                    st.plotly_chart(fig_sd, use_container_width=True)
+
+                col3, col4 = st.columns(2)
+                with col3:
+                    target_age = targets["age_group"].value_counts().reset_index()
+                    target_age.columns = ["Age Group", "Count"]
+                    fig_tage = px.pie(
+                        target_age,
+                        names="Age Group",
+                        values="Count",
+                        title="Target Age Distribution",
+                        color_discrete_sequence=px.colors.qualitative.Set2,
+                    )
+                    fig_tage.update_layout(height=350)
+                    st.plotly_chart(fig_tage, use_container_width=True)
+
+                with col4:
+                    target_party = targets["Party"].value_counts().reset_index()
+                    target_party.columns = ["Party", "Count"]
+                    target_party["Party"] = target_party["Party"].replace("", "Unaffiliated")
+                    fig_tp = px.pie(
+                        target_party,
+                        names="Party",
+                        values="Count",
+                        title="Target Party Affiliation",
+                        color="Party",
+                        color_discrete_map={
+                            "D": "#3498db",
+                            "Unaffiliated": "#95a5a6",
+                        },
+                    )
+                    fig_tp.update_layout(height=350)
+                    st.plotly_chart(fig_tp, use_container_width=True)
+
+                # Sample of top targets
+                st.subheader("Top Priority Targets (Sample)")
+                display_cols = [
+                    "PrecinctName", "Area", "Party", "Age", "Gender",
+                    "general_score", "voter_type", "priority_score",
+                    "surge_2020",
+                ]
+                rename_map = {
+                    "PrecinctName": "Precinct", "general_score": "Gen Score (0-4)",
+                    "voter_type": "Voter Type", "priority_score": "Priority",
+                    "surge_2020": "Surge 2020",
+                }
+                top_sample = targets.head(100)[display_cols].rename(columns=rename_map)
+                st.dataframe(top_sample, use_container_width=True, hide_index=True, height=400)
+
+                st.caption("Priority score combines area competitiveness, turnout history, "
+                           "party affiliation, surge voter status, and age. "
+                           "Higher = more valuable to contact.")
+
+        elif vf_section == "Precinct Drill-Down":
+            st.subheader("Precinct Voter Profile")
+
+            precinct_list = sorted(vf["PrecinctName"].unique())
+            selected_precinct = st.selectbox(
+                "Select Precinct",
+                precinct_list,
+                key="vf_precinct_select",
+            )
+
+            profile = get_precinct_voter_profile(vf, selected_precinct)
+
+            if not profile:
+                st.warning("No data for this precinct.")
+            else:
+                # KPI row
+                k1, k2, k3, k4 = st.columns(4)
+                with k1:
+                    st.metric("Total Voters", f"{profile['total_voters']:,}")
+                with k2:
+                    st.metric("Active", f"{profile['active']:,}")
+                with k3:
+                    st.metric("D Primary %", f"{profile['d_primary_pct']}%")
+                with k4:
+                    st.metric("2024 Turnout", f"{profile['general_2024_turnout']}%")
+
+                st.markdown(f"**Area:** {profile['area']} | "
+                            f"**Avg Age:** {profile['avg_age']} | "
+                            f"**Avg General Score:** {profile['avg_general_score']}/4 | "
+                            f"**Surge 2020 Voters:** {profile['surge_2020_count']}")
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    party_bd = profile["party_breakdown"]
+                    party_data = pd.DataFrame([
+                        {"Party": "Republican", "Count": party_bd.get("R", 0)},
+                        {"Party": "Democratic", "Count": party_bd.get("D", 0)},
+                        {"Party": "Unaffiliated", "Count": party_bd.get("", 0)},
+                    ])
+                    fig_pp = px.pie(
+                        party_data,
+                        names="Party",
+                        values="Count",
+                        title="Party (Primary Pull)",
+                        color="Party",
+                        color_discrete_map={
+                            "Republican": "#e74c3c",
+                            "Democratic": "#3498db",
+                            "Unaffiliated": "#95a5a6",
+                        },
+                    )
+                    fig_pp.update_layout(height=300)
+                    st.plotly_chart(fig_pp, use_container_width=True)
+
+                with col2:
+                    vt_bd = profile["voter_type_breakdown"]
+                    vt_data = pd.DataFrame([
+                        {"Type": t, "Count": vt_bd.get(t, 0)}
+                        for t in ["Super Voter", "Regular", "Occasional", "Inactive"]
+                    ])
+                    fig_vtp = px.pie(
+                        vt_data,
+                        names="Type",
+                        values="Count",
+                        title="Voter Engagement Types",
+                        color="Type",
+                        color_discrete_map={
+                            "Super Voter": "#27ae60", "Regular": "#2ecc71",
+                            "Occasional": "#f39c12", "Inactive": "#e74c3c",
+                        },
+                    )
+                    fig_vtp.update_layout(height=300)
+                    st.plotly_chart(fig_vtp, use_container_width=True)
+
+                col3, col4 = st.columns(2)
+                with col3:
+                    age_bd = profile["age_breakdown"]
+                    age_data = pd.DataFrame([
+                        {"Age Group": ag, "Count": age_bd.get(ag, 0)}
+                        for ag in ["18-29", "30-44", "45-64", "65+"]
+                    ])
+                    fig_ap = px.bar(
+                        age_data,
+                        x="Age Group",
+                        y="Count",
+                        title="Age Distribution",
+                        color="Age Group",
+                        color_discrete_sequence=px.colors.qualitative.Set2,
+                    )
+                    fig_ap.update_layout(height=300, showlegend=False)
+                    st.plotly_chart(fig_ap, use_container_width=True)
+
+                with col4:
+                    st.markdown("#### Contact Info")
+                    st.markdown(f"- **Has Phone:** {profile['has_phone_pct']}%")
+                    st.markdown(f"- **Has Email:** {profile['has_email_pct']}%")
+                    st.markdown("")
+                    st.markdown("#### Voter History")
+                    pct_voters = vf[vf["PrecinctName"] == selected_precinct]
+                    for ename in ["General2024", "General2022", "General2020", "General2018"]:
+                        rate = (pct_voters[ename] == "Y").sum() / max(len(pct_voters), 1) * 100
+                        st.markdown(f"- **{ename}:** {rate:.1f}%")
+
+                # Voter detail table
+                with st.expander("View individual voter records"):
+                    pct_display = vf[vf["PrecinctName"] == selected_precinct].copy()
+                    display_cols = [
+                        "VANID", "FirstName", "LastName", "Age", "Gender", "Party",
+                        "voter_type", "general_score", "General2024", "General2022",
+                        "General2020", "General2018",
+                    ]
+                    st.dataframe(
+                        pct_display[display_cols].sort_values("general_score", ascending=False),
+                        use_container_width=True,
+                        hide_index=True,
+                        height=400,
+                    )
 
 
 # Footer
