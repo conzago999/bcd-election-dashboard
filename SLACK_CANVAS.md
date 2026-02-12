@@ -16,7 +16,7 @@ An interactive election data dashboard for Boone County Democrats, built to help
 
 ## How It Works
 
-The dashboard has **5 tabs**, each serving a different purpose:
+The dashboard has **9 tabs**, each serving a different purpose:
 
 ### Tab 1: The Big Picture
 The executive summary. Shows headline KPIs (D vote share, turnout, straight-ticket %, contested races) with trend deltas, the top 3 strategic opportunities auto-generated from the data, and the blue shift trend charts over time.
@@ -49,6 +49,35 @@ Raw data browser for verification and research:
 - **Elections Overview** — All 23 elections with confidence scores; drill into any election to see its races and which race names were cleaned up
 - **Race & Result Browser** — Pick any election + race to see precinct-level vote counts for every candidate
 - **Data Quality Report** — Confidence scoring breakdown, import log
+
+### Tab 6: Demographics
+Census data correlated with voting patterns. Uses Census ACS 5-Year data mapped to 5 geographic areas:
+- **Community Profile** — Population, income, education, race, housing by area
+- **Demographics vs. Voting** — Scatter plots: does income/education/age predict D vote share?
+- **Tract Detail** — All 11 Boone County census tracts with full demographic data
+
+### Tab 7: Campaign Finance
+Indiana state campaign finance data filtered to Boone County ZIP codes:
+- **Overview** — Total contributions and year-over-year trends (2018-2024)
+- **Party Breakdown** — D vs R fundraising (donor counts, totals, avg donation size)
+- **Top Recipients** — Highest-funded committees in Boone County
+- **Donor Geography** — Contributions by area (Zionsville vs Lebanon vs rural)
+
+### Tab 8: 2026 Prep
+2026 midterm election planning tool. Uses historical midterm data (2014, 2018, 2022) to identify which seats are up and where D can compete:
+- **Target Board** — All 58 expected 2026 races with priority classification (High/Medium/Recruit/Low)
+- **Recruitment Targets** — 42 races where R ran uncontested in 2022
+- **Trending Races** — 8 races where D vote share is increasing across cycles
+- **Historical Detail** — Full D% pivot table across 2014/2018/2022
+
+### Tab 9: Voter File
+Voter-level analysis using VAN-format voter file data. Currently running on synthetic (fake) data for development — will switch to real data when available. Four sub-sections:
+- **Voter Universe** — 62,062 registered voters broken down by party (primary pull), age, gender, engagement level, and geographic area
+- **Turnout Scoring** — Every voter scored by how many of the last 4 generals they voted in. Identifies 16,640 "surge voters" (voted 2020, skipped 2022) who are the #1 GOTV target for 2026
+- **Persuasion Targets** — 27,443 contactable voters who are unaffiliated or D-leaning, actively voting, and in competitive areas. Priority scored for canvassing.
+- **Precinct Drill-Down** — Select any precinct to see full voter profile: party mix, age, engagement types, turnout history, and individual voter records
+
+**Important note about the Voter File tab:** This tab currently uses **synthetic (fake) data** that was generated to match real Boone County distributions (correct precinct sizes, realistic age/party/turnout patterns). The fake data lets us build and test the analysis tools. When Abbey gets a real VAN voter file export, it drops right in — same format, real data, instant analysis. **No real voter data is stored on GitHub or the cloud.**
 
 ---
 
@@ -140,11 +169,13 @@ All data comes from official Boone County Clerk digital PDFs. Each election is s
 ## How to Use the Dashboard
 
 1. Go to the live link above
-2. The 5 tabs across the top are your main navigation
-3. Within Tabs 2-4, use the radio buttons to switch between sub-sections
+2. The 9 tabs across the top are your main navigation
+3. Within most tabs, use the radio buttons to switch between sub-sections
 4. Most charts are interactive — hover for details, click legend items to show/hide
 5. Look for "View data" expanders below charts to see the raw numbers
 6. Use the Data Explorer tab (Tab 5) to browse any election, race, or candidate directly
+7. The Demographics tab (Tab 6) requires a Census API key configured in Streamlit Cloud secrets
+8. The Voter File tab (Tab 9) uses synthetic data on the cloud — for real analysis, run locally with your VAN export
 
 ---
 
